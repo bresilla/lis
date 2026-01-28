@@ -167,61 +167,22 @@ endfunction()
 process_deps(LIB_DEPS LIB_DEP_TARGETS)
 
 # ==================================================================================================
-# Main library
+# Main executable (this repo is an app, not a library)
 # ==================================================================================================
-file(GLOB_RECURSE LIB_SOURCES CONFIGURE_DEPENDS "src/${PROJECT_NAME}/*.cpp")
+add_executable(${PROJECT_NAME} "src/${PROJECT_NAME}.cpp")
 
-if(LIB_SOURCES)
-    add_library(${PROJECT_NAME} STATIC ${LIB_SOURCES})
-    target_include_directories(${PROJECT_NAME} PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:include>
-    )
-    target_compile_definitions(${PROJECT_NAME} PUBLIC
-        $<$<BOOL:${SHORT_NAMESPACE}>:SHORT_NAMESPACE>
-        $<$<BOOL:${EXPOSE_ALL}>:${PROJECT_NAME_UPPER}_EXPOSE_ALL>
-    )
-else()
-    add_library(${PROJECT_NAME} INTERFACE)
-    target_include_directories(${PROJECT_NAME} INTERFACE
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:include>
-    )
-    if(SHORT_NAMESPACE)
-        target_compile_definitions(${PROJECT_NAME} INTERFACE SHORT_NAMESPACE)
-    endif()
-    if(EXPOSE_ALL)
-        target_compile_definitions(${PROJECT_NAME} INTERFACE ${PROJECT_NAME_UPPER}_EXPOSE_ALL)
-    endif()
-endif()
+target_include_directories(${PROJECT_NAME} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+    $<$<BOOL:${SHORT_NAMESPACE}>:SHORT_NAMESPACE>
+    $<$<BOOL:${EXPOSE_ALL}>:${PROJECT_NAME_UPPER}_EXPOSE_ALL>
+)
 
 if(LIB_DEP_TARGETS)
-    get_target_property(_lib_type ${PROJECT_NAME} TYPE)
-    if(_lib_type STREQUAL "INTERFACE_LIBRARY")
-        target_link_libraries(${PROJECT_NAME} INTERFACE ${LIB_DEP_TARGETS})
-    else()
-        target_link_libraries(${PROJECT_NAME} PUBLIC ${LIB_DEP_TARGETS})
-    endif()
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${LIB_DEP_TARGETS})
 endif()
-
-add_library(${PROJECT_NAME}::${PROJECT_NAME} ALIAS ${PROJECT_NAME})
-
-# ==================================================================================================
-# Installation
-# ==================================================================================================
-include(GNUInstallDirs)
-
-install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(TARGETS ${PROJECT_NAME} EXPORT ${PROJECT_NAME}Targets)
-install(EXPORT ${PROJECT_NAME}Targets
-    FILE ${PROJECT_NAME}Targets.cmake
-    NAMESPACE ${PROJECT_NAME}::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}
-)
-export(EXPORT ${PROJECT_NAME}Targets
-    FILE "${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}Targets.cmake"
-    NAMESPACE ${PROJECT_NAME}::
-)
 
 # ==================================================================================================
 # Examples
@@ -235,7 +196,7 @@ if(${PROJECT_NAME_UPPER}_BUILD_EXAMPLES)
         get_filename_component(exec_name "${src_file}" NAME_WE)
         add_executable(${exec_name} "${src_file}")
         target_compile_definitions(${exec_name} PRIVATE SHORT_NAMESPACE HAS_RERUN PROJECT_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
-        target_link_libraries(${exec_name} ${PROJECT_NAME}::${PROJECT_NAME} ${ALL_EXAMPLE_DEPS})
+        target_link_libraries(${exec_name} PRIVATE ${ALL_EXAMPLE_DEPS})
         install(TARGETS ${exec_name} DESTINATION bin)
     endforeach()
 endif()
@@ -254,7 +215,7 @@ if(${PROJECT_NAME_UPPER}_ENABLE_TESTS)
         add_executable(${test_name} "${src_file}")
         target_compile_definitions(${test_name} PRIVATE SHORT_NAMESPACE DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN PROJECT_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
             $<$<BOOL:${${PROJECT_NAME_UPPER}_BIG_TRANSFER}>:BIG_TRANSFER>)
-        target_link_libraries(${test_name} ${PROJECT_NAME}::${PROJECT_NAME} ${ALL_TEST_DEPS})
+        target_link_libraries(${test_name} PRIVATE ${ALL_TEST_DEPS})
         add_test(NAME ${test_name} COMMAND ${test_name})
     endforeach()
 endif()
