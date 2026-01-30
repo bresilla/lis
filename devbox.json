@@ -6,7 +6,8 @@
     "clang-tools@latest",
     "stdenv@latest",
     "zig@latest",
-    "xmake@latest"
+    "xmake@latest",
+    "nix-ld@latest"
   ],
   "shell": {
     "init_hook": [

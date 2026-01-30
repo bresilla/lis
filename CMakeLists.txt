@@ -70,7 +70,7 @@ cmake_policy(SET CMP0074 NEW)
 cmake_policy(SET CMP0135 NEW)
 
 # Compiler-specific flags
-set(COMMON_FLAGS -Wall -Wextra -Wpedantic -Wno-reorder -Wno-narrowing -Wno-array-bounds -Wno-vla
+set(COMMON_FLAGS -O3 -Wall -Wextra -Wpedantic -Wno-reorder -Wno-narrowing -Wno-array-bounds -Wno-vla
     -Wno-unused-variable -Wno-unused-parameter -Wno-unused-result -Wno-unused-but-set-variablei -Wno-parentheses)
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")

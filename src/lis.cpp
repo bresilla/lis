@@ -874,15 +874,15 @@ namespace {
     static void render(const TreeState &s) {
         int term_width = get_terminal_width();
 
-        // Clear and set terminal background if alt_screen and bg_color set
+        // Move cursor to home position without clearing (reduces flicker)
+        std::cout << "\x1b[H";
+
+        // Set terminal background if alt_screen and bg_color set
         if (s.alt_screen && s.bg_color >= 0) {
-            // Set bg color, clear screen (which fills with bg), then home
-            std::cout << "\x1b[48;5;" << s.bg_color << "m\x1b[2J\x1b[H";
-        } else {
-            std::cout << "\x1b[2J\x1b[H";
+            std::cout << "\x1b[48;5;" << s.bg_color << "m";
         }
         if (s.show_header) {
-            std::cout << "lis - tree.nvim-ish file browser\r\n";
+            std::cout << "lis - tree.nvim-ish file browser\x1b[K\r\n";
             std::cout << "root: " << s.root.string() << "  [sort: " << sort_name(s.sort) << "]";
             if (!s.selected.empty()) {
                 std::cout << "  [" << s.selected.size() << " selected]";
@@ -890,23 +890,23 @@ namespace {
             if (!s.clipboard.paths.empty()) {
                 std::cout << "  [" << s.clipboard.paths.size() << (s.clipboard.is_cut ? " cut" : " copied") << "]";
             }
-            std::cout << "\r\n";
-            std::cout << "j/k:move l/h/enter:open/close space:mark .:hidden s:sort c:cd\r\n";
-            std::cout << "y:copy d:cut p:paste D:delete r:rename n:file N:dir o:open q:quit\r\n";
+            std::cout << "\x1b[K\r\n";
+            std::cout << "j/k:move l/h/enter:open/close space:mark .:hidden s:sort c:cd\x1b[K\r\n";
+            std::cout << "y:copy d:cut p:paste D:delete r:rename n:file N:dir o:open q:quit\x1b[K\r\n";
             if (!s.message.empty()) {
                 std::string msg = echo::format::String(s.message.c_str()).fg("#fabd2f").to_string();
                 if (s.alt_screen && s.bg_color >= 0) {
                     msg = apply_persistent_bg(msg, s.bg_color);
                 }
-                std::cout << msg << "\r\n";
+                std::cout << msg << "\x1b[K\r\n";
             }
-            std::cout << "\r\n";
+            std::cout << "\x1b[K\r\n";
         } else if (!s.message.empty()) {
             std::string msg = echo::format::String(s.message.c_str()).fg("#fabd2f").to_string();
             if (s.alt_screen && s.bg_color >= 0) {
                 msg = apply_persistent_bg(msg, s.bg_color);
             }
-            std::cout << msg << "\r\n";
+            std::cout << msg << "\x1b[K\r\n";
         }
 
         for (dp::i32 i = 0; i < static_cast<dp::i32>(s.visible.size()); ++i) {
@@ -1018,10 +1018,11 @@ namespace {
                     std::cout << "\x1b[48;5;" << s.bg_color << "m";
                 std::cout << "\r\n";
             } else {
-                std::cout << out_line << "\r\n";
+                std::cout << out_line << "\x1b[K\r\n";
             }
         }
-        std::cout << std::flush;
+        // Clear from cursor to end of screen (removes leftover lines from previous render)
+        std::cout << "\x1b[J" << std::flush;
     }
 
     // =============================================================================================
@@ -1294,10 +1295,12 @@ namespace {
     // Main event loop
     // =============================================================================================
 
-    static dp::Result<dp::Optional<fs::path>, dp::String> run_tree(TreeState &s) {
+    static dp::Result<dp::Optional<fs::path>, dp::String> run_tree(TreeState &s, const dp::String &output_file) {
         // Enter alternate screen if requested
         if (s.alt_screen) {
-            std::cout << "\x1b[?1049h" << std::flush;
+            std::cout << "\x1b[?1049h"; // Enter alternate screen
+            std::cout << "\x1b[?25l";   // Hide cursor
+            std::cout << std::flush;
         }
 
         scan::terminal::RawMode raw;
@@ -1346,8 +1349,11 @@ namespace {
         for (;;) {
             auto key = scan::input::read_key();
             if (!key) {
-                if (s.alt_screen)
-                    std::cout << "\x1b[?1049l" << std::flush;
+                if (s.alt_screen) {
+                    std::cout << "\x1b[?25h";   // Show cursor
+                    std::cout << "\x1b[?1049l"; // Leave alternate screen
+                    std::cout << std::flush;
+                }
                 return dp::result::Err(dp::String("failed to read key"));
             }
 
@@ -1369,8 +1375,11 @@ namespace {
                 switch (key->rune) {
                 case 'q':
                 case 'Q':
-                    if (s.alt_screen)
-                        std::cout << "\x1b[?1049l" << std::flush;
+                    if (s.alt_screen) {
+                        std::cout << "\x1b[?25h";   // Show cursor
+                        std::cout << "\x1b[?1049l"; // Leave alternate screen
+                        std::cout << std::flush;
+                    }
                     return dp::result::Ok(dp::Optional<fs::path>{});
                 case 'j':
                 case 'J':
@@ -1527,8 +1536,16 @@ namespace {
                     rebuild_visible(s);
                     s.cursor = find_entry_index(s, entry_path);
                 } else {
-                    if (s.alt_screen)
-                        std::cout << "\x1b[?1049l" << std::flush;
+                    if (s.alt_screen) {
+                        std::cout << "\x1b[?25h";   // Show cursor
+                        std::cout << "\x1b[?1049l"; // Leave alternate screen
+                        std::cout << std::flush;
+                    }
+                    if (!output_file.empty()) {
+                        std::ofstream ofs(output_file.c_str());
+                        ofs << e.path.string() << "\n";
+                        return dp::result::Ok(dp::Optional<fs::path>{});
+                    }
                     return dp::result::Ok(dp::Optional<fs::path>(e.path));
                 }
             } break;
@@ -1543,8 +1560,11 @@ namespace {
             } break;
             case Key::Escape:
             case Key::CtrlC:
-                if (s.alt_screen)
-                    std::cout << "\x1b[?1049l" << std::flush;
+                if (s.alt_screen) {
+                    std::cout << "\x1b[?25h";   // Show cursor
+                    std::cout << "\x1b[?1049l"; // Leave alternate screen
+                    std::cout << std::flush;
+                }
                 return dp::result::Ok(dp::Optional<fs::path>{});
             default:
                 break;
@@ -1559,6 +1579,7 @@ namespace {
 int main(int argc, char *argv[]) {
     std::string path_str;
     std::string cwd_str;
+    std::string output_str;
     bool show_hidden = false;
     bool alt_screen = false;
     bool no_header = false;
@@ -1578,6 +1599,11 @@ int main(int argc, char *argv[]) {
                      .help("Path to open (file or directory, or file to highlight if --cwd is set)")
                      .value_of(path_str))
             .arg(argu::Arg("cwd").long_name("cwd").help("Root directory for the tree").value_of(cwd_str))
+            .arg(argu::Arg("output")
+                     .short_name('o')
+                     .long_name("output")
+                     .help("Write selected path to file instead of stdout")
+                     .value_of(output_str))
             .arg(argu::Arg("all").short_name('a').long_name("all").help("Show hidden files").flag(show_hidden))
             .arg(argu::Arg("alt")
                      .short_name('A')
@@ -1665,7 +1691,7 @@ int main(int argc, char *argv[]) {
     state.sel_bg_color = static_cast<dp::i32>(sel_bg_color);
     state.highlight_target = highlight_target;
 
-    auto selected = run_tree(state);
+    auto selected = run_tree(state, dp::String(output_str.c_str()));
     if (!selected) {
         std::cerr << "error: " << selected.error() << "\n";
         return 1;
