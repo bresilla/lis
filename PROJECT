@@ -25,6 +25,7 @@ lis
 echo|https://github.com/bresilla/echo.git|0.0.25
 scan|https://github.com/bresilla/scan.git|0.0.10
 datapod|https://github.com/robolibs/datapod.git|0.0.41
+pkg::ncursesw
 
 [example]
 # pkg::rerun_sdk

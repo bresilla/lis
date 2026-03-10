@@ -1,241 +1,230 @@
-#include <argu/argu.hpp>
-#include <datapod/datapod.hpp>
-#include <echo/echo.hpp>
-#include <echo/format.hpp>
-#include <scan/input/reader.hpp>
-#include <scan/terminal/raw_mode.hpp>
+#include <locale.h>
+#include <ncurses.h>
 
 #include <algorithm>
-#include <array>
-#include <chrono>
-#include <cstddef>
+#include <cerrno>
 #include <cstdlib>
-#include <ctime>
 #include <filesystem>
 #include <fstream>
-#include <iomanip>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <set>
-#include <sstream>
 #include <string>
-#include <sys/ioctl.h>
-#include <unistd.h>
+#include <string_view>
+#include <vector>
 
 namespace fs = std::filesystem;
 
 namespace {
 
-    // =============================================================================================
-    // Constants - tree.nvim style glyphs
-    // =============================================================================================
+    constexpr std::string_view INDENT_PIPE = "│ ";
+    constexpr std::string_view INDENT_BRANCH = "├ ";
+    constexpr std::string_view INDENT_LAST = "└ ";
+    constexpr std::string_view INDENT_SPACE = "  ";
 
-    constexpr const char *INDENT_PIPE = "│ ";
-    constexpr const char *INDENT_BRANCH = "├ ";
-    constexpr const char *INDENT_LAST = "└ ";
-    constexpr const char *INDENT_SPACE = "  ";
+    constexpr std::string_view GIT_UNTRACKED = "✭";
+    constexpr std::string_view GIT_MODIFIED = "✹";
+    constexpr std::string_view GIT_STAGED = "✚";
+    constexpr std::string_view GIT_RENAMED = "➜";
+    constexpr std::string_view GIT_IGNORED = "☒";
+    constexpr std::string_view GIT_UNMERGED = "═";
+    constexpr std::string_view GIT_DELETED = "✖";
+    constexpr std::string_view GIT_UNKNOWN = "?";
 
-    constexpr const char *GIT_UNTRACKED = "✭";
-    constexpr const char *GIT_MODIFIED = "✹";
-    constexpr const char *GIT_STAGED = "✚";
-    constexpr const char *GIT_RENAMED = "➜";
-    constexpr const char *GIT_IGNORED = "☒";
-    constexpr const char *GIT_UNMERGED = "═";
-    constexpr const char *GIT_DELETED = "✖";
-    constexpr const char *GIT_UNKNOWN = "?";
+    constexpr std::string_view MARK_SELECTED = "✓";
+    constexpr std::string_view MARK_READONLY = "✗";
 
-    constexpr const char *MARK_SELECTED = "✓";
-    constexpr const char *MARK_READONLY = "✗";
+    constexpr std::string_view ICON_FOLDER_CLOSED = "";
+    constexpr std::string_view ICON_FOLDER_OPEN = "";
+    constexpr std::string_view ICON_FOLDER_SYMLINK = "";
+    constexpr std::string_view ICON_FILE_DEFAULT = "";
+    constexpr std::string_view ICON_FILE_SYMLINK = "";
 
-    constexpr const char *ICON_FOLDER_CLOSED = "\xee\x97\xbf";
-    constexpr const char *ICON_FOLDER_OPEN = "\xee\x97\xbe";
-    constexpr const char *ICON_FOLDER_SYMLINK = "\xef\x92\x82";
-    constexpr const char *ICON_FILE_DEFAULT = "\xee\x98\x92";
-    constexpr const char *ICON_FILE_SYMLINK = "\xef\x92\x81";
+    enum class EntryKind { Directory, File };
+    enum class GitKind { None, Untracked, Modified, Staged, Renamed, Ignored, Unmerged, Deleted, Unknown };
 
-    // =============================================================================================
-    // Enums
-    // =============================================================================================
+    enum ColorPairId : short {
+        PAIR_DEFAULT = 1,
+        PAIR_DIRECTORY = 2,
+        PAIR_FILE = 3,
+        PAIR_GIT_WARN = 4,
+        PAIR_GIT_OK = 5,
+        PAIR_GIT_BAD = 6,
+        PAIR_DIM = 7,
+        PAIR_SELECTION = 8,
+    };
 
-    enum class EntryKind : dp::u8 { Directory, File, Symlink };
-
-    enum class GitKind : dp::u8 { Untracked, Modified, Staged, Renamed, Ignored, Unmerged, Deleted, Unknown, None };
-
-    enum class SortKind : dp::u8 { Name, Extension, Size, Time, NameRev, ExtensionRev, SizeRev, TimeRev };
-
-    // =============================================================================================
-    // Entry - represents a file/directory in the tree
-    // =============================================================================================
+    constexpr short ANSI_WHITE = 15;
+    constexpr short ANSI_TEXT = 253;
+    constexpr short ANSI_DIM = 244;
+    constexpr short ANSI_FILE = 2;
+    constexpr short ANSI_GIT_WARN = 220;
+    constexpr short ANSI_GIT_OK = 142;
+    constexpr short ANSI_GIT_BAD = 167;
+    constexpr short ANSI_ICON_DIR = 37;
+    constexpr short ANSI_ACCENT_RED = 167;
 
     struct Entry {
-        dp::String name;
         fs::path path;
-        EntryKind kind{};
-        GitKind git{};
-        bool is_hidden{};
-        bool is_readonly{};
-        bool is_selected{};
-
-        dp::u16 depth{};
-        bool is_last{};
-        dp::Vector<bool> ancestor_has_more;
-
-        bool is_expanded{};
-        dp::String icon;
-
-        // File metadata
-        dp::u64 size{};
-        std::time_t mtime{};
-        dp::String extension;
+        std::string name;
+        std::string icon;
+        EntryKind kind = EntryKind::File;
+        GitKind git = GitKind::None;
+        bool is_hidden = false;
+        bool is_readonly = false;
+        bool is_last = false;
+        bool is_expanded = false;
+        int depth = 0;
+        std::vector<bool> ancestor_has_more;
+        std::uintmax_t size = 0;
     };
 
-    // =============================================================================================
-    // Clipboard - for copy/move/paste
-    // =============================================================================================
-
-    struct Clipboard {
-        dp::Vector<fs::path> paths;
-        bool is_cut = false; // false = copy, true = move
-    };
-
-    // =============================================================================================
-    // TreeState - global state
-    // =============================================================================================
-
-    struct TreeState {
+    struct Options {
         fs::path root;
-        dp::Vector<Entry> visible;
-        dp::i32 cursor = 0;
-
-        // Display options
+        fs::path highlight_target;
+        std::string output_file;
         bool show_hidden = false;
+        bool show_header = true;
+        bool alt_screen = false;
         bool show_git = false;
         bool show_size = false;
-        bool show_time = false;
-        bool show_mark = true;
-        bool show_header = true;
-        bool use_ansi = true;
-        bool alt_screen = false;
-        bool generic_icons = false; // Use same icon for all files
-        dp::i32 max_depth = -1;     // -1 = unlimited
-        dp::i32 bg_color = -1;      // -1 = default, 0-255 = ANSI 256-color for terminal bg
-        dp::i32 sel_bg_color = -1;  // -1 = default, 0-255 = ANSI 256-color for selection bg
-
-        // Sorting
-        SortKind sort = SortKind::Name;
-
-        // Selection
-        std::set<fs::path> selected;
-
-        // Clipboard
-        Clipboard clipboard;
-
-        // Git status cache
-        std::map<fs::path, GitKind> git_status;
-        fs::path git_root;
-
-        // Message to display
-        dp::String message;
-
-        // Initial highlight target
-        fs::path highlight_target;
+        bool generic_icons = false;
+        int max_depth = -1;
+        int background_color = -1;
+        int selection_background_color = -1;
     };
 
-    // =============================================================================================
-    // Utility functions
-    // =============================================================================================
+    struct TreeState {
+        Options options;
+        std::vector<Entry> visible;
+        int cursor = 0;
+        std::map<fs::path, GitKind> git_status;
+    };
 
-    static dp::String path_to_string(const fs::path &p) { return dp::String(p.string().c_str()); }
-
-    static int get_terminal_width() {
-        struct winsize w;
-        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &w) == 0) {
-            return w.ws_col;
+    struct CursesSession {
+        explicit CursesSession(const Options &options) {
+            setlocale(LC_ALL, "");
+            initscr();
+            raw();
+            noecho();
+            nonl();
+            keypad(stdscr, TRUE);
+            leaveok(stdscr, TRUE);
+            curs_set(0);
+            init_colors(options);
         }
-        return 80; // fallback
-    }
 
-    // Calculate visible width (excluding ANSI escape codes)
-    static int visible_width(const std::string &s) {
-        int width = 0;
-        bool in_escape = false;
-        for (size_t i = 0; i < s.size(); ++i) {
-            if (s[i] == '\x1b') {
-                in_escape = true;
-            } else if (in_escape) {
-                if (s[i] == 'm')
-                    in_escape = false;
-            } else {
-                // Handle UTF-8: count codepoints, not bytes
-                unsigned char c = static_cast<unsigned char>(s[i]);
-                if ((c & 0xC0) != 0x80) { // Not a continuation byte
-                    ++width;
-                }
+        ~CursesSession() {
+            curs_set(1);
+            endwin();
+        }
+
+        static void init_colors(const Options &options) {
+            if (!has_colors()) {
+                return;
             }
+
+            start_color();
+            use_default_colors();
+
+            const short base_bg = (options.background_color >= 0 && COLORS > options.background_color)
+                                      ? static_cast<short>(options.background_color)
+                                      : -1;
+            const short selection_bg =
+                (options.selection_background_color >= 0 && COLORS > options.selection_background_color)
+                    ? static_cast<short>(options.selection_background_color)
+                    : COLOR_BLACK;
+
+            init_pair(PAIR_DEFAULT, -1, base_bg);
+            init_pair(PAIR_DIRECTORY, 1, base_bg);
+            init_pair(PAIR_FILE, ANSI_FILE, base_bg);
+            init_pair(PAIR_GIT_WARN, ANSI_GIT_WARN, base_bg);
+            init_pair(PAIR_GIT_OK, ANSI_GIT_OK, base_bg);
+            init_pair(PAIR_GIT_BAD, ANSI_GIT_BAD, base_bg);
+            init_pair(PAIR_DIM, ANSI_DIM, base_bg);
+            init_pair(PAIR_SELECTION, -1, selection_bg);
+            bkgd(COLOR_PAIR(PAIR_DEFAULT));
         }
-        return width;
+    };
+
+    static bool is_hidden_name(const std::string &name) { return !name.empty() && name.front() == '.'; }
+
+    static std::string lower_string(std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        return value;
     }
 
-    // Replace all ANSI resets with reset + background color
-    static std::string apply_persistent_bg(const std::string &s, int bg_color) {
-        if (bg_color < 0)
-            return s;
-        std::string bg_code = "\x1b[48;5;" + std::to_string(bg_color) + "m";
-        std::string reset = "\x1b[0m";
-        std::string result;
-        result.reserve(s.size() * 2);
-
-        size_t pos = 0;
-        size_t found;
-        while ((found = s.find(reset, pos)) != std::string::npos) {
-            result.append(s, pos, found - pos);
-            result.append(reset);
-            result.append(bg_code);
-            pos = found + reset.size();
+    static std::string icon_for_name(const std::string &name, bool generic_icons) {
+        if (generic_icons) {
+            return std::string(ICON_FILE_DEFAULT);
         }
-        result.append(s, pos, s.size() - pos);
-        return result;
+
+        struct IconDef {
+            const char *icon;
+            const char *color;
+        };
+
+        static const std::map<std::string, IconDef> icons = {
+            {"c", {"", "#599eff"}},     {"cpp", {"", "#519aba"}},       {"cc", {"", "#f34b7d"}},
+            {"cxx", {"", "#519aba"}},   {"h", {"", "#a074c4"}},         {"hpp", {"", "#a074c4"}},
+            {"rs", {"", "#dea584"}},    {"py", {"", "#ffbc03"}},        {"lua", {"", "#00a2ff"}},
+            {"js", {"", "#cbcb41"}},    {"ts", {"", "#519aba"}},        {"jsx", {"", "#20c2e3"}},
+            {"tsx", {"", "#1354bf"}},   {"html", {"", "#e44d26"}},      {"css", {"", "#663399"}},
+            {"json", {"", "#cbcb41"}},  {"yaml", {"", "#6d8086"}},      {"yml", {"", "#6d8086"}},
+            {"toml", {"", "#9c4221"}},  {"sh", {"", "#4d5a5e"}},        {"bash", {"", "#89e051"}},
+            {"zsh", {"", "#89e051"}},   {"go", {"", "#00add8"}},        {"zig", {"", "#f69a1b"}},
+            {"md", {"", "#dddddd"}},    {"txt", {"", "#89e051"}},       {"makefile", {"", "#6d8086"}},
+            {"cmake", {"", "#dce3eb"}}, {"gitignore", {"", "#f54d27"}}, {"vim", {"", "#019833"}},
+            {"nvim", {"", "#019833"}},  {"pdf", {"", "#b30b00"}},       {"png", {"", "#a074c4"}},
+            {"jpg", {"", "#a074c4"}},   {"jpeg", {"", "#a074c4"}},      {"svg", {"", "#ffb13b"}},
+        };
+
+        const std::string lower_name = lower_string(name);
+        auto full = icons.find(lower_name);
+        if (full != icons.end()) {
+            return full->second.icon;
+        }
+        const auto dot = lower_name.rfind('.');
+        if (dot == std::string::npos || dot + 1 >= lower_name.size()) {
+            return std::string(ICON_FILE_DEFAULT);
+        }
+
+        auto it = icons.find(lower_name.substr(dot + 1));
+        return it == icons.end() ? std::string(ICON_FILE_DEFAULT) : it->second.icon;
     }
 
-    static bool is_hidden_name(const dp::String &name) { return !name.empty() && name[0] == '.'; }
-
-    static dp::String format_size(dp::u64 bytes) {
-        const char *units[] = {"B", "K", "M", "G", "T"};
-        int unit = 0;
-        double size = static_cast<double>(bytes);
-        while (size >= 1024.0 && unit < 4) {
-            size /= 1024.0;
-            unit++;
+    static std::string icon_color_for_name(const std::string &name) {
+        struct IconDef {
+            const char *icon;
+            const char *color;
+        };
+        static const std::map<std::string, IconDef> icons = {
+            {"c", {"", "#599eff"}},     {"cpp", {"", "#519aba"}},       {"cc", {"", "#f34b7d"}},
+            {"cxx", {"", "#519aba"}},   {"h", {"", "#a074c4"}},         {"hpp", {"", "#a074c4"}},
+            {"rs", {"", "#dea584"}},    {"py", {"", "#ffbc03"}},        {"lua", {"", "#00a2ff"}},
+            {"js", {"", "#cbcb41"}},    {"ts", {"", "#519aba"}},        {"jsx", {"", "#20c2e3"}},
+            {"tsx", {"", "#1354bf"}},   {"html", {"", "#e44d26"}},      {"css", {"", "#663399"}},
+            {"json", {"", "#cbcb41"}},  {"yaml", {"", "#6d8086"}},      {"yml", {"", "#6d8086"}},
+            {"toml", {"", "#9c4221"}},  {"sh", {"", "#4d5a5e"}},        {"bash", {"", "#89e051"}},
+            {"zsh", {"", "#89e051"}},   {"go", {"", "#00add8"}},        {"zig", {"", "#f69a1b"}},
+            {"md", {"", "#dddddd"}},    {"txt", {"", "#89e051"}},       {"makefile", {"", "#6d8086"}},
+            {"cmake", {"", "#dce3eb"}}, {"gitignore", {"", "#f54d27"}}, {"vim", {"", "#019833"}},
+            {"nvim", {"", "#019833"}},  {"pdf", {"", "#b30b00"}},       {"png", {"", "#a074c4"}},
+            {"jpg", {"", "#a074c4"}},   {"jpeg", {"", "#a074c4"}},      {"svg", {"", "#ffb13b"}},
+        };
+        const std::string lower_name = lower_string(name);
+        auto full = icons.find(lower_name);
+        if (full != icons.end()) {
+            return full->second.color;
         }
-        std::ostringstream oss;
-        if (unit == 0) {
-            oss << bytes << units[unit];
-        } else {
-            oss << std::fixed << std::setprecision(1) << size << units[unit];
+        const auto dot = lower_name.rfind('.');
+        if (dot == std::string::npos || dot + 1 >= lower_name.size()) {
+            return "#999999";
         }
-        return dp::String(oss.str().c_str());
-    }
-
-    static dp::String format_time(std::time_t t) {
-        std::tm *tm = std::localtime(&t);
-        std::ostringstream oss;
-        oss << std::put_time(tm, "%b %d %H:%M");
-        return dp::String(oss.str().c_str());
-    }
-
-    // =============================================================================================
-    // Git status detection
-    // =============================================================================================
-
-    static fs::path find_git_root(const fs::path &start) {
-        fs::path current = start;
-        while (!current.empty() && current != current.root_path()) {
-            if (fs::exists(current / ".git")) {
-                return current;
-            }
-            current = current.parent_path();
-        }
-        return {};
+        auto it = icons.find(lower_name.substr(dot + 1));
+        return it == icons.end() ? "#999999" : it->second.color;
     }
 
     static GitKind classify_git(char x, char y) {
@@ -258,1449 +247,740 @@ namespace {
         return GitKind::Unknown;
     }
 
-    static void refresh_git_status(TreeState &s) {
-        s.git_status.clear();
-        s.git_root = find_git_root(s.root);
-        if (s.git_root.empty())
-            return;
-
-        // Run git status --porcelain
-        std::string cmd = "cd \"" + s.git_root.string() + "\" && git status --porcelain -uall 2>/dev/null";
-        FILE *pipe = popen(cmd.c_str(), "r");
-        if (!pipe)
-            return;
-
-        char buffer[512];
-        while (fgets(buffer, sizeof(buffer), pipe)) {
-            std::string line(buffer);
-            if (line.size() < 4)
-                continue;
-            char x = line[0];
-            char y = line[1];
-            std::string path_str = line.substr(3);
-            // Remove trailing newline
-            while (!path_str.empty() && (path_str.back() == '\n' || path_str.back() == '\r')) {
-                path_str.pop_back();
-            }
-            fs::path full_path = s.git_root / path_str;
-            s.git_status[fs::weakly_canonical(full_path)] = classify_git(x, y);
-        }
-        pclose(pipe);
-    }
-
-    // =============================================================================================
-    // Icons
-    // =============================================================================================
-
-    static dp::String git_glyph(GitKind g) {
-        switch (g) {
+    static std::string git_glyph(GitKind git) {
+        switch (git) {
         case GitKind::Untracked:
-            return GIT_UNTRACKED;
+            return std::string(GIT_UNTRACKED);
         case GitKind::Modified:
-            return GIT_MODIFIED;
+            return std::string(GIT_MODIFIED);
         case GitKind::Staged:
-            return GIT_STAGED;
+            return std::string(GIT_STAGED);
         case GitKind::Renamed:
-            return GIT_RENAMED;
+            return std::string(GIT_RENAMED);
         case GitKind::Ignored:
-            return GIT_IGNORED;
+            return std::string(GIT_IGNORED);
         case GitKind::Unmerged:
-            return GIT_UNMERGED;
+            return std::string(GIT_UNMERGED);
         case GitKind::Deleted:
-            return GIT_DELETED;
+            return std::string(GIT_DELETED);
         case GitKind::Unknown:
-            return GIT_UNKNOWN;
+            return std::string(GIT_UNKNOWN);
         default:
             return " ";
         }
     }
 
-    static echo::format::String git_styled_ansi(GitKind g) {
-        switch (g) {
-        case GitKind::Modified:
-        case GitKind::Renamed:
-            return echo::format::String(git_glyph(g).c_str()).fg("#fabd2f");
-        case GitKind::Staged:
-            return echo::format::String(git_glyph(g).c_str()).fg("#b8bb26");
-        case GitKind::Unmerged:
-        case GitKind::Deleted:
-            return echo::format::String(git_glyph(g).c_str()).fg("#fb4934");
-        case GitKind::Untracked:
-        case GitKind::Ignored:
-        case GitKind::Unknown:
-            return echo::format::String(git_glyph(g).c_str()).fg("#928374");
-        default:
-            return echo::format::String(" ");
-        }
-    }
-
-    struct IconDef {
-        const char *icon;
-        const char *color;
-    };
-
-    static const std::map<dp::String, IconDef> &get_icon_map() {
-        static const std::map<dp::String, IconDef> icons = {
-            // C/C++
-            {"c", {"\xee\x98\x9e", "#599EFF"}},
-            {"cpp", {"\xee\x98\x9d", "#519ABA"}},
-            {"cc", {"\xee\x98\x9d", "#F34B7D"}},
-            {"cxx", {"\xee\x98\x9d", "#519ABA"}},
-            {"h", {"\xef\x83\xbd", "#A074C4"}},
-            {"hpp", {"\xef\x83\xbd", "#A074C4"}},
-            {"hxx", {"\xef\x83\xbd", "#A074C4"}},
-            {"hh", {"\xef\x83\xbd", "#A074C4"}},
-            // Rust
-            {"rs", {"\xee\x9a\x8b", "#DEA584"}},
-            // Python
-            {"py", {"\xee\x98\x86", "#FFBC03"}},
-            {"pyi", {"\xee\x98\x86", "#FFBC03"}},
-            {"pyc", {"\xee\x98\x86", "#FFE873"}},
-            {"pyw", {"\xee\x98\x86", "#FFBC03"}},
-            // Lua
-            {"lua", {"\xee\x98\xa0", "#51A0CF"}},
-            {"luau", {"\xee\x98\xa0", "#00A2FF"}},
-            // JavaScript/TypeScript
-            {"js", {"\xee\x98\x8c", "#CBCB41"}},
-            {"mjs", {"\xee\x98\x8c", "#F1E05A"}},
-            {"cjs", {"\xee\x98\x8c", "#CBCB41"}},
-            {"ts", {"\xee\x98\xa8", "#519ABA"}},
-            {"mts", {"\xee\x98\xa8", "#519ABA"}},
-            {"cts", {"\xee\x98\xa8", "#519ABA"}},
-            {"jsx", {"\xee\x98\xa5", "#20C2E3"}},
-            {"tsx", {"\xee\x9e\xba", "#1354BF"}},
-            {"d.ts", {"\xee\x98\xa8", "#D59855"}},
-            // Web
-            {"html", {"\xee\x9c\xb6", "#E44D26"}},
-            {"htm", {"\xee\x98\x8e", "#E34C26"}},
-            {"css", {"\xee\x9a\xb8", "#663399"}},
-            {"scss", {"\xee\x98\x83", "#F55385"}},
-            {"sass", {"\xee\x98\x83", "#F55385"}},
-            {"less", {"\xee\x98\x94", "#563D7C"}},
-            {"vue", {"\xee\x9a\xa0", "#8DC149"}},
-            {"svelte", {"\xee\x9a\x97", "#FF3E00"}},
-            {"astro", {"\xee\x9a\xb3", "#E23F67"}},
-            // Data formats
-            {"json", {"\xee\x98\x8b", "#CBCB41"}},
-            {"jsonc", {"\xee\x98\x8b", "#CBCB41"}},
-            {"json5", {"\xee\x98\x8b", "#CBCB41"}},
-            {"yaml", {"\xee\x98\x95", "#6D8086"}},
-            {"yml", {"\xee\x98\x95", "#6D8086"}},
-            {"toml", {"\xee\x9a\xb2", "#9C4221"}},
-            {"xml", {"\xf3\xb0\x97\x80", "#E37933"}},
-            {"csv", {"\xee\x99\x8a", "#89E051"}},
-            // Shell
-            {"sh", {"\xee\x9e\x95", "#4D5A5E"}},
-            {"bash", {"\xee\x9d\xa0", "#89E051"}},
-            {"zsh", {"\xee\x9e\x95", "#89E051"}},
-            {"fish", {"\xee\x9e\x95", "#4D5A5E"}},
-            {"ps1", {"\xee\x98\x95", "#012456"}},
-            {"bat", {"\xee\x98\x95", "#C1F12E"}},
-            {"cmd", {"\xee\x98\x95", "#C1F12E"}},
-            {"awk", {"\xee\x9e\x95", "#4D5A5E"}},
-            // Go
-            {"go", {"\xee\x98\xa7", "#00ADD8"}},
-            {"mod", {"\xee\x98\xa7", "#00ADD8"}},
-            {"sum", {"\xee\x98\xa7", "#00ADD8"}},
-            // Java/JVM
-            {"java", {"\xee\x9c\xb8", "#CC3E44"}},
-            {"jar", {"\xee\x9c\xb8", "#CC3E44"}},
-            {"class", {"\xee\x9c\xb8", "#CC3E44"}},
-            {"kt", {"\xee\x98\xb4", "#7F52FF"}},
-            {"kts", {"\xee\x98\xb4", "#7F52FF"}},
-            {"scala", {"\xee\x98\xb7", "#CC3E44"}},
-            {"groovy", {"\xee\x98\xb7", "#4298B8"}},
-            {"gradle", {"\xee\x99\xa0", "#005F87"}},
-            // .NET
-            {"cs", {"\xf3\xb0\x8c\x9b", "#596706"}},
-            {"csx", {"\xf3\xb0\x8c\x9b", "#596706"}},
-            {"fs", {"\xee\x9e\xa7", "#519ABA"}},
-            {"fsx", {"\xee\x9e\xa7", "#519ABA"}},
-            {"vb", {"\xee\x98\x97", "#945DB7"}},
-            {"sln", {"\xee\x98\x97", "#854CC7"}},
-            {"csproj", {"\xf3\xb0\xaa\xae", "#512BD4"}},
-            // Ruby
-            {"rb", {"\xee\x9e\x91", "#701516"}},
-            {"erb", {"\xee\x98\x8e", "#701516"}},
-            {"rake", {"\xee\x9e\x91", "#701516"}},
-            {"gemspec", {"\xee\x9e\x91", "#701516"}},
-            // PHP
-            {"php", {"\xee\x98\x88", "#A074C4"}},
-            {"phtml", {"\xee\x98\x88", "#A074C4"}},
-            // Swift/Apple
-            {"swift", {"\xee\x9d\x95", "#E37933"}},
-            {"m", {"\xee\x98\x9e", "#599EFF"}},
-            {"mm", {"\xee\x98\x9d", "#519ABA"}},
-            // Zig/Nim
-            {"zig", {"\xee\x9a\xa9", "#F69A1B"}},
-            {"nim", {"\xee\x99\xb7", "#F3D400"}},
-            // Functional
-            {"hs", {"\xee\x98\x9f", "#A074C4"}},
-            {"lhs", {"\xee\x98\x9f", "#A074C4"}},
-            {"ml", {"\xee\x99\xba", "#E37933"}},
-            {"mli", {"\xee\x99\xba", "#E37933"}},
-            {"ex", {"\xee\x98\xad", "#A074C4"}},
-            {"exs", {"\xee\x98\xad", "#A074C4"}},
-            {"erl", {"\xee\x9e\xb1", "#B83998"}},
-            {"hrl", {"\xee\x9e\xb1", "#B83998"}},
-            {"clj", {"\xee\x9d\xa8", "#8DC149"}},
-            {"cljs", {"\xee\x9d\xaa", "#519ABA"}},
-            {"cljc", {"\xee\x9d\xa8", "#8DC149"}},
-            {"el", {"\xee\x98\xb2", "#8172BE"}},
-            {"elm", {"\xee\x98\xac", "#519ABA"}},
-            // Data science
-            {"r", {"\xf3\xb0\x9f\x94", "#2266BA"}},
-            {"rmd", {"\xf3\xb0\x9f\x94", "#2266BA"}},
-            {"jl", {"\xee\x98\xa4", "#A270BA"}},
-            {"ipynb", {"\xee\xa0\x8f", "#F57D01"}},
-            // Mobile
-            {"dart", {"\xee\x9e\x98", "#03589C"}},
-            // Database
-            {"sql", {"\xee\x9c\x86", "#DAD8D8"}},
-            {"sqlite", {"\xee\x9c\x86", "#DAD8D8"}},
-            {"db", {"\xee\x9c\x86", "#DAD8D8"}},
-            {"graphql", {"\xef\x88\x8e", "#E535AB"}},
-            {"gql", {"\xef\x88\x8e", "#E535AB"}},
-            {"prisma", {"\xee\x98\x8b", "#0C344B"}},
-            // DevOps/Config
-            {"dockerfile", {"\xf3\xb0\xa1\xa8", "#458EE6"}},
-            {"dockerignore", {"\xf3\xb0\xa1\xa8", "#458EE6"}},
-            {"nix", {"\xef\x8c\x93", "#7EBAE4"}},
-            {"tf", {"\xee\x98\x97", "#5C4EE5"}},
-            {"tfvars", {"\xee\x98\x97", "#5C4EE5"}},
-            {"hcl", {"\xee\x98\x97", "#5C4EE5"}},
-            // Build/Make
-            {"makefile", {"\xee\x9d\xb9", "#6D8086"}},
-            {"gnumakefile", {"\xee\x9d\xb9", "#6D8086"}},
-            {"cmake", {"\xee\x9e\x94", "#DCE3EB"}},
-            {"meson", {"\xee\x98\x97", "#6D8086"}},
-            // Docs
-            {"md", {"\xef\x92\x8a", "#DDDDDD"}},
-            {"markdown", {"\xee\x98\x89", "#DDDDDD"}},
-            {"mdx", {"\xef\x92\x8a", "#519ABA"}},
-            {"rst", {"\xef\x92\x8a", "#DDDDDD"}},
-            {"txt", {"\xef\x85\x9c", "#89E051"}},
-            {"org", {"\xee\x98\xb3", "#77AA99"}},
-            {"tex", {"\xee\x98\x97", "#3D6117"}},
-            {"bib", {"\xf3\xb1\x89\x9f", "#CBCB41"}},
-            // Git
-            {"git", {"\xee\x9c\x82", "#F14C28"}},
-            {"gitignore", {"\xee\x9c\x82", "#F14C28"}},
-            {"gitmodules", {"\xee\x9c\x82", "#F14C28"}},
-            {"gitattributes", {"\xee\x9c\x82", "#F14C28"}},
-            // Editor
-            {"vim", {"\xee\x98\xab", "#019833"}},
-            {"nvim", {"\xee\x98\xab", "#019833"}},
-            {"vimrc", {"\xee\x98\xab", "#019833"}},
-            {"editorconfig", {"\xee\x98\x8b", "#FFFFFF"}},
-            // Archives
-            {"zip", {"\xef\x90\x90", "#ECA517"}},
-            {"tar", {"\xef\x90\x90", "#ECA517"}},
-            {"gz", {"\xef\x90\x90", "#ECA517"}},
-            {"xz", {"\xef\x90\x90", "#ECA517"}},
-            {"bz2", {"\xef\x90\x90", "#ECA517"}},
-            {"7z", {"\xef\x90\x90", "#ECA517"}},
-            {"rar", {"\xef\x90\x90", "#ECA517"}},
-            {"deb", {"\xef\x90\x90", "#A80030"}},
-            {"rpm", {"\xef\x90\x90", "#EE0000"}},
-            // Images
-            {"png", {"\xee\x98\x8d", "#A074C4"}},
-            {"jpg", {"\xee\x98\x8d", "#A074C4"}},
-            {"jpeg", {"\xee\x98\x8d", "#A074C4"}},
-            {"gif", {"\xee\x98\x8d", "#A074C4"}},
-            {"bmp", {"\xee\x98\x8d", "#A074C4"}},
-            {"ico", {"\xee\x98\x8d", "#CBCB41"}},
-            {"webp", {"\xee\x98\x8d", "#A074C4"}},
-            {"svg", {"\xef\x86\xb2", "#FFB13B"}},
-            {"avif", {"\xee\x98\x8d", "#A074C4"}},
-            // Audio/Video
-            {"mp3", {"\xef\x80\x81", "#00AFFF"}},
-            {"wav", {"\xef\x80\x81", "#00AFFF"}},
-            {"flac", {"\xef\x80\x81", "#0075AA"}},
-            {"ogg", {"\xef\x80\x81", "#0075AA"}},
-            {"aac", {"\xef\x80\x81", "#00AFFF"}},
-            {"mp4", {"\xee\x9a\x9f", "#FD971F"}},
-            {"mkv", {"\xee\x9a\x9f", "#FD971F"}},
-            {"avi", {"\xee\x9a\x9f", "#FD971F"}},
-            {"mov", {"\xee\x9a\x9f", "#FD971F"}},
-            {"webm", {"\xee\x9a\x9f", "#FD971F"}},
-            // Fonts
-            {"ttf", {"\xef\x80\xb1", "#ECECEC"}},
-            {"otf", {"\xef\x80\xb1", "#ECECEC"}},
-            {"woff", {"\xef\x80\xb1", "#ECECEC"}},
-            {"woff2", {"\xef\x80\xb1", "#ECECEC"}},
-            // Documents
-            {"pdf", {"\xee\x98\x87", "#B30B00"}},
-            {"doc", {"\xf3\xb0\x88\xac", "#185ABD"}},
-            {"docx", {"\xf3\xb0\x88\xac", "#185ABD"}},
-            {"xls", {"\xef\x8d\xb8", "#207245"}},
-            {"xlsx", {"\xef\x8d\xb8", "#207245"}},
-            {"ppt", {"\xef\x8d\xba", "#CB4A32"}},
-            {"pptx", {"\xef\x8d\xba", "#CB4A32"}},
-            {"odt", {"\xef\x8d\xbc", "#2DCBFD"}},
-            {"ods", {"\xef\x8d\xb8", "#78FC4E"}},
-            {"odp", {"\xef\x8d\xba", "#FE9C45"}},
-            // Misc
-            {"lock", {"\xee\x99\xb2", "#BBBBBB"}},
-            {"log", {"\xf3\xb0\x8c\xb1", "#DDDDDD"}},
-            {"env", {"\xef\x91\xa2", "#FAF743"}},
-            {"conf", {"\xee\x98\x95", "#6D8086"}},
-            {"cfg", {"\xee\x98\x95", "#6D8086"}},
-            {"ini", {"\xee\x98\x95", "#6D8086"}},
-            {"license", {"\xee\x98\x8a", "#CBCB41"}},
-            {"readme", {"\xef\x92\x8a", "#DDDDDD"}},
-            // Additional common
-            {"asm", {"\xee\x98\xb7", "#0091BD"}},
-            {"s", {"\xee\x98\xb7", "#0091BD"}},
-            {"cr", {"\xee\x98\xaf", "#C8C8C8"}},
-            {"coffee", {"\xee\x98\x9b", "#CBCB41"}},
-            {"diff", {"\xee\x9c\xa8", "#41535B"}},
-            {"patch", {"\xee\x9c\xa8", "#41535B"}},
-            {"d", {"\xee\x9e\xaf", "#B03931"}},
-            {"ada", {"\xee\x9a\xb5", "#599EFF"}},
-            {"adb", {"\xee\x9a\xb5", "#599EFF"}},
-            {"ads", {"\xee\x9a\xb5", "#A074C4"}},
-            {"hbs", {"\xee\x98\x8f", "#F0772B"}},
-            {"mustache", {"\xee\x98\x8f", "#E37933"}},
-            {"ejs", {"\xee\x98\x8e", "#CBCB41"}},
-            {"haml", {"\xee\x98\x8e", "#EAEAE1"}},
-            {"pug", {"\xee\x98\x8e", "#A86454"}},
-            {"hx", {"\xee\x99\xa6", "#EA8220"}},
-            {"gleam", {"\xef\x80\x85", "#FFAFF3"}},
-            {"odin", {"\xf3\xb0\x9f\xa2", "#3882D2"}},
-            {"v", {"\xee\x98\x97", "#5D87BF"}},
-            {"vert", {"\xee\xa1\x95", "#5586A6"}},
-            {"frag", {"\xee\xa1\x95", "#5586A6"}},
-            {"glsl", {"\xee\xa1\x95", "#5586A6"}},
-            {"wgsl", {"\xee\xa1\x95", "#5586A6"}},
-            {"cu", {"\xee\x99\x8b", "#89E051"}},
-            {"cuh", {"\xee\x99\x8b", "#A074C4"}},
-        };
-        return icons;
-    }
-
-    static dp::String file_icon_for(const dp::String &name, bool is_symlink) {
-        if (is_symlink)
-            return ICON_FILE_SYMLINK;
-
-        // Check full filename first (for files like Makefile, Dockerfile)
-        dp::String lower_name;
-        for (char c : name)
-            lower_name += static_cast<char>(std::tolower(c));
-
-        const auto &icons = get_icon_map();
-        auto it = icons.find(lower_name);
-        if (it != icons.end())
-            return it->second.icon;
-
-        // Check extension
-        auto dot = name.rfind('.');
-        if (dot == dp::String::npos)
-            return ICON_FILE_DEFAULT;
-
-        dp::String ext;
-        for (size_t i = dot + 1; i < name.size(); i++) {
-            ext += static_cast<char>(std::tolower(name[i]));
+    static void refresh_git_status(TreeState &state) {
+        state.git_status.clear();
+        if (!state.options.show_git) {
+            return;
         }
 
-        it = icons.find(ext);
-        if (it != icons.end())
-            return it->second.icon;
-
-        return ICON_FILE_DEFAULT;
-    }
-
-    static dp::String file_icon_color(const dp::String &name) {
-        dp::String lower_name;
-        for (char c : name)
-            lower_name += static_cast<char>(std::tolower(c));
-
-        const auto &icons = get_icon_map();
-        auto it = icons.find(lower_name);
-        if (it != icons.end())
-            return it->second.color;
-
-        auto dot = name.rfind('.');
-        if (dot == dp::String::npos)
-            return "#999999";
-
-        dp::String ext;
-        for (size_t i = dot + 1; i < name.size(); i++) {
-            ext += static_cast<char>(std::tolower(name[i]));
+        fs::path current = state.options.root;
+        while (!current.empty() && current != current.root_path() && !fs::exists(current / ".git")) {
+            current = current.parent_path();
+        }
+        if (current.empty() || !fs::exists(current / ".git")) {
+            return;
         }
 
-        it = icons.find(ext);
-        if (it != icons.end())
-            return it->second.color;
-
-        return "#999999";
-    }
-
-    static echo::format::String icon_styled_ansi(const dp::String &icon, const Entry &e) {
-        if (e.kind == EntryKind::Directory || (e.kind == EntryKind::Symlink && fs::is_directory(e.path))) {
-            return echo::format::String(icon.c_str()).fg("#00afaf");
+        const std::string command = "cd \"" + current.string() + "\" && git status --porcelain -uall 2>/dev/null";
+        FILE *pipe = popen(command.c_str(), "r");
+        if (!pipe) {
+            return;
         }
-        return echo::format::String(icon.c_str()).fg(file_icon_color(e.name).c_str());
-    }
 
-    static echo::format::String filename_styled_ansi(const Entry &e, bool is_cursor) {
-        auto base = echo::format::String(e.name.c_str());
-        if (e.kind == EntryKind::Directory)
-            base = base.fg("#689FB6");
-        else if (e.is_selected)
-            base = base.fg("#b8bb26");
-        else
-            base = base.fg("#F09F17");
-        if (is_cursor)
-            base = base.bold();
-        return base;
-    }
-
-    // =============================================================================================
-    // Directory listing with sorting
-    // =============================================================================================
-
-    static dp::Result<dp::Vector<Entry>, dp::String> list_dir_entries(const fs::path &dir, dp::u16 depth,
-                                                                      TreeState &state) {
-        dp::Vector<Entry> out;
-        try {
-            dp::Vector<Entry> dirs;
-            dp::Vector<Entry> files;
-
-            for (const auto &it : fs::directory_iterator(dir)) {
-                fs::path p = it.path();
-                dp::String name = dp::String(p.filename().string().c_str());
-                bool hidden = is_hidden_name(name);
-                if (hidden && !state.show_hidden)
-                    continue;
-
-                Entry e;
-                e.name = std::move(name);
-                e.path = p;
-                e.depth = depth;
-                e.is_hidden = hidden;
-                e.is_expanded = false;
-                e.is_selected = state.selected.count(fs::weakly_canonical(p)) > 0;
-
-                // Get git status
-                auto git_it = state.git_status.find(fs::weakly_canonical(p));
-                e.git = (git_it != state.git_status.end()) ? git_it->second : GitKind::None;
-
-                // Get file metadata
-                try {
-                    auto status = fs::status(p);
-                    e.is_readonly = (status.permissions() & fs::perms::owner_write) == fs::perms::none;
-                    if (fs::is_regular_file(status)) {
-                        e.size = fs::file_size(p);
-                    }
-                    e.mtime =
-                        std::chrono::system_clock::to_time_t(std::chrono::file_clock::to_sys(fs::last_write_time(p)));
-                } catch (...) {
-                }
-
-                // Get extension
-                auto dot = e.name.rfind('.');
-                if (dot != dp::String::npos) {
-                    e.extension = e.name.substr(dot + 1);
-                }
-
-                if (fs::is_symlink(it.symlink_status())) {
-                    e.kind = EntryKind::Symlink;
-                    try {
-                        if (fs::is_directory(p)) {
-                            e.kind = EntryKind::Directory;
-                            e.icon = ICON_FOLDER_SYMLINK;
-                            dirs.push_back(std::move(e));
-                        } else {
-                            e.kind = EntryKind::File;
-                            e.icon = state.generic_icons ? ICON_FILE_DEFAULT : file_icon_for(e.name, true);
-                            files.push_back(std::move(e));
-                        }
-                    } catch (...) {
-                        e.kind = EntryKind::File;
-                        e.icon = state.generic_icons ? ICON_FILE_DEFAULT : ICON_FILE_SYMLINK;
-                        files.push_back(std::move(e));
-                    }
-                } else if (fs::is_directory(it.status())) {
-                    e.kind = EntryKind::Directory;
-                    e.icon = ICON_FOLDER_CLOSED;
-                    dirs.push_back(std::move(e));
-                } else {
-                    e.kind = EntryKind::File;
-                    e.icon = state.generic_icons ? ICON_FILE_DEFAULT : file_icon_for(e.name, false);
-                    files.push_back(std::move(e));
-                }
+        char buffer[512];
+        while (fgets(buffer, sizeof(buffer), pipe)) {
+            std::string line(buffer);
+            if (line.size() < 4) {
+                continue;
             }
-
-            // Sort based on current sort mode
-            auto sorter = [&state](const Entry &a, const Entry &b) -> bool {
-                switch (state.sort) {
-                case SortKind::Name:
-                    return a.name < b.name;
-                case SortKind::NameRev:
-                    return a.name > b.name;
-                case SortKind::Extension:
-                    return a.extension < b.extension;
-                case SortKind::ExtensionRev:
-                    return a.extension > b.extension;
-                case SortKind::Size:
-                    return a.size < b.size;
-                case SortKind::SizeRev:
-                    return a.size > b.size;
-                case SortKind::Time:
-                    return a.mtime < b.mtime;
-                case SortKind::TimeRev:
-                    return a.mtime > b.mtime;
-                default:
-                    return a.name < b.name;
-                }
-            };
-
-            std::sort(dirs.begin(), dirs.end(), sorter);
-            std::sort(files.begin(), files.end(), sorter);
-
-            for (auto &d : dirs)
-                out.push_back(std::move(d));
-            for (auto &f : files)
-                out.push_back(std::move(f));
-        } catch (const fs::filesystem_error &ex) {
-            return dp::result::Err(dp::String(ex.what()));
+            std::string path_part = line.substr(3);
+            while (!path_part.empty() && (path_part.back() == '\n' || path_part.back() == '\r')) {
+                path_part.pop_back();
+            }
+            std::error_code error;
+            const fs::path full_path = fs::weakly_canonical(current / path_part, error);
+            if (!error) {
+                state.git_status[full_path] = classify_git(line[0], line[1]);
+            }
         }
-
-        return dp::result::Ok(std::move(out));
+        pclose(pipe);
     }
 
-    // =============================================================================================
-    // Tree building
-    // =============================================================================================
-
-    static dp::i32 find_entry_index(const TreeState &s, const fs::path &p) {
-        auto canon = fs::weakly_canonical(p);
-        for (dp::i32 i = 0; i < static_cast<dp::i32>(s.visible.size()); ++i) {
-            if (fs::weakly_canonical(s.visible[static_cast<dp::usize>(i)].path) == canon)
-                return i;
+    static int find_entry_index(const TreeState &state, const fs::path &path) {
+        std::error_code path_error;
+        const fs::path target = fs::weakly_canonical(path, path_error);
+        for (std::size_t index = 0; index < state.visible.size(); ++index) {
+            std::error_code entry_error;
+            const fs::path current = fs::weakly_canonical(state.visible[index].path, entry_error);
+            if (!path_error && !entry_error && current == target) {
+                return static_cast<int>(index);
+            }
         }
         return -1;
     }
 
-    static void rebuild_visible(TreeState &s) {
-        dp::Vector<fs::path> expanded;
-        for (const auto &e : s.visible) {
-            if (e.kind == EntryKind::Directory && e.is_expanded) {
-                expanded.push_back(fs::weakly_canonical(e.path));
+    static std::vector<Entry> list_children(const fs::path &dir, TreeState &state, int depth) {
+        std::vector<Entry> directories;
+        std::vector<Entry> files;
+
+        for (const auto &item : fs::directory_iterator(dir)) {
+            const fs::path path = item.path();
+            const std::string name = path.filename().string();
+            if (!state.options.show_hidden && is_hidden_name(name)) {
+                continue;
+            }
+
+            Entry entry;
+            entry.path = path;
+            entry.name = name;
+            entry.depth = depth;
+            std::error_code perms_error;
+            const auto status = item.status(perms_error);
+            entry.is_readonly = !perms_error && (status.permissions() & fs::perms::owner_write) == fs::perms::none;
+
+            std::error_code type_error;
+            if (item.is_directory(type_error) && !type_error) {
+                entry.kind = EntryKind::Directory;
+                entry.icon = std::string(ICON_FOLDER_CLOSED);
+                directories.push_back(std::move(entry));
+            } else {
+                entry.kind = EntryKind::File;
+                entry.icon = icon_for_name(name, state.options.generic_icons);
+                std::error_code size_error;
+                entry.size = item.is_regular_file(size_error) && !size_error ? item.file_size(size_error) : 0;
+                files.push_back(std::move(entry));
             }
         }
 
-        s.visible.clear();
+        auto sort_by_name = [](const Entry &left, const Entry &right) { return left.name < right.name; };
+        std::sort(directories.begin(), directories.end(), sort_by_name);
+        std::sort(files.begin(), files.end(), sort_by_name);
 
+        directories.insert(directories.end(), files.begin(), files.end());
+        for (std::size_t index = 0; index < directories.size(); ++index) {
+            directories[index].is_last = index + 1 == directories.size();
+            std::error_code error;
+            const fs::path canonical = fs::weakly_canonical(directories[index].path, error);
+            if (!error) {
+                auto git_it = state.git_status.find(canonical);
+                if (git_it != state.git_status.end()) {
+                    directories[index].git = git_it->second;
+                }
+            }
+        }
+        return directories;
+    }
+
+    static void rebuild_visible(TreeState &state) {
+        std::set<fs::path> expanded;
+        for (const Entry &entry : state.visible) {
+            if (entry.kind == EntryKind::Directory && entry.is_expanded) {
+                std::error_code error;
+                expanded.insert(fs::weakly_canonical(entry.path, error));
+            }
+        }
+
+        state.visible.clear();
         Entry root;
-        root.name = dp::String(s.root.filename().string().empty() ? s.root.string().c_str()
-                                                                  : s.root.filename().string().c_str());
-        root.path = s.root;
+        root.path = state.options.root;
+        root.name = state.options.root.filename().empty() ? state.options.root.string()
+                                                          : state.options.root.filename().string();
+        root.icon = std::string(ICON_FOLDER_OPEN);
         root.kind = EntryKind::Directory;
-        root.git = GitKind::None;
-        root.is_hidden = false;
-        root.depth = 0;
         root.is_last = true;
         root.is_expanded = true;
-        root.icon = ICON_FOLDER_OPEN;
-        root.is_selected = s.selected.count(fs::weakly_canonical(s.root)) > 0;
-        s.visible.push_back(std::move(root));
+        state.visible.push_back(root);
 
-        for (dp::i32 i = 0; i < static_cast<dp::i32>(s.visible.size()); ++i) {
-            auto &e = s.visible[static_cast<dp::usize>(i)];
-            if (e.kind != EntryKind::Directory || !e.is_expanded)
+        for (std::size_t index = 0; index < state.visible.size(); ++index) {
+            Entry &entry = state.visible[index];
+            if (entry.kind != EntryKind::Directory || !entry.is_expanded) {
                 continue;
-
-            auto children_res = list_dir_entries(e.path, static_cast<dp::u16>(e.depth + 1), s);
-            if (!children_res)
-                continue;
-            auto children = std::move(children_res.value());
-
-            for (dp::usize idx = 0; idx < children.size(); ++idx) {
-                auto &c = children[idx];
-                c.is_last = (idx + 1 == children.size());
-                c.ancestor_has_more = e.ancestor_has_more;
-                if (e.depth > 0) {
-                    c.ancestor_has_more.push_back(!e.is_last);
-                }
-                if (c.kind == EntryKind::Directory) {
-                    fs::path canon = fs::weakly_canonical(c.path);
-                    c.is_expanded = std::find(expanded.begin(), expanded.end(), canon) != expanded.end();
-                    c.icon = c.is_expanded ? ICON_FOLDER_OPEN : ICON_FOLDER_CLOSED;
-                }
             }
 
-            dp::usize insert_at = static_cast<dp::usize>(i + 1);
-            for (auto &c : children) {
-                s.visible.insert(s.visible.begin() + static_cast<std::ptrdiff_t>(insert_at), std::move(c));
-                insert_at++;
+            std::vector<Entry> children = list_children(entry.path, state, entry.depth + 1);
+            for (Entry &child : children) {
+                child.ancestor_has_more = entry.ancestor_has_more;
+                if (entry.depth > 0) {
+                    child.ancestor_has_more.push_back(!entry.is_last);
+                }
+                if (child.kind == EntryKind::Directory) {
+                    std::error_code error;
+                    const fs::path canonical = fs::weakly_canonical(child.path, error);
+                    child.is_expanded = !error && expanded.contains(canonical);
+                    child.icon = child.is_expanded ? std::string(ICON_FOLDER_OPEN) : std::string(ICON_FOLDER_CLOSED);
+                }
             }
+            state.visible.insert(state.visible.begin() + static_cast<std::ptrdiff_t>(index + 1), children.begin(),
+                                 children.end());
         }
 
-        if (s.cursor < 0)
-            s.cursor = 0;
-        if (s.cursor >= static_cast<dp::i32>(s.visible.size()))
-            s.cursor = static_cast<dp::i32>(s.visible.empty() ? 0 : (s.visible.size() - 1));
-    }
-
-    // =============================================================================================
-    // Rendering
-    // =============================================================================================
-
-    static dp::String sort_name(SortKind s) {
-        switch (s) {
-        case SortKind::Name:
-            return "name";
-        case SortKind::NameRev:
-            return "name-rev";
-        case SortKind::Extension:
-            return "ext";
-        case SortKind::ExtensionRev:
-            return "ext-rev";
-        case SortKind::Size:
-            return "size";
-        case SortKind::SizeRev:
-            return "size-rev";
-        case SortKind::Time:
-            return "time";
-        case SortKind::TimeRev:
-            return "time-rev";
-        default:
-            return "name";
-        }
-    }
-
-    static void render(const TreeState &s) {
-        int term_width = get_terminal_width();
-
-        // Move cursor to home position without clearing (reduces flicker)
-        std::cout << "\x1b[H";
-
-        // Set terminal background if alt_screen and bg_color set
-        if (s.alt_screen && s.bg_color >= 0) {
-            std::cout << "\x1b[48;5;" << s.bg_color << "m";
-        }
-        if (s.show_header) {
-            std::cout << "lis - tree.nvim-ish file browser\x1b[K\r\n";
-            std::cout << "root: " << s.root.string() << "  [sort: " << sort_name(s.sort) << "]";
-            if (!s.selected.empty()) {
-                std::cout << "  [" << s.selected.size() << " selected]";
-            }
-            if (!s.clipboard.paths.empty()) {
-                std::cout << "  [" << s.clipboard.paths.size() << (s.clipboard.is_cut ? " cut" : " copied") << "]";
-            }
-            std::cout << "\x1b[K\r\n";
-            std::cout << "j/k:move l/h/enter:open/close space:mark .:hidden s:sort c:cd\x1b[K\r\n";
-            std::cout << "y:copy d:cut p:paste D:delete r:rename n:file N:dir o:open q:quit\x1b[K\r\n";
-            if (!s.message.empty()) {
-                std::string msg = echo::format::String(s.message.c_str()).fg("#fabd2f").to_string();
-                if (s.alt_screen && s.bg_color >= 0) {
-                    msg = apply_persistent_bg(msg, s.bg_color);
-                }
-                std::cout << msg << "\x1b[K\r\n";
-            }
-            std::cout << "\x1b[K\r\n";
-        } else if (!s.message.empty()) {
-            std::string msg = echo::format::String(s.message.c_str()).fg("#fabd2f").to_string();
-            if (s.alt_screen && s.bg_color >= 0) {
-                msg = apply_persistent_bg(msg, s.bg_color);
-            }
-            std::cout << msg << "\x1b[K\r\n";
-        }
-
-        for (dp::i32 i = 0; i < static_cast<dp::i32>(s.visible.size()); ++i) {
-            const auto &e = s.visible[static_cast<dp::usize>(i)];
-            bool is_cursor = (i == s.cursor);
-            std::string out_line;
-
-            // Cursor prefix
-            if (is_cursor) {
-                if (s.use_ansi)
-                    out_line += echo::format::String("> ").fg("#FFFFFF").bold().to_string();
-                else
-                    out_line += "> ";
-            } else {
-                out_line += "  ";
-            }
-
-            // Mark column (selected/readonly)
-            if (s.show_mark) {
-                if (e.is_selected) {
-                    if (s.use_ansi)
-                        out_line += echo::format::String(MARK_SELECTED).fg("#b8bb26").to_string();
-                    else
-                        out_line += MARK_SELECTED;
-                } else if (e.is_readonly) {
-                    if (s.use_ansi)
-                        out_line += echo::format::String(MARK_READONLY).fg("#fb4934").to_string();
-                    else
-                        out_line += MARK_READONLY;
-                } else {
-                    out_line += " ";
-                }
-                out_line += " ";
-            }
-
-            // Indent column
-            if (e.depth > 0) {
-                dp::usize start_ancestor = 0;
-                if (s.max_depth >= 0 && e.ancestor_has_more.size() > static_cast<dp::usize>(s.max_depth)) {
-                    start_ancestor = e.ancestor_has_more.size() - static_cast<dp::usize>(s.max_depth);
-                }
-                for (dp::usize a = start_ancestor; a < e.ancestor_has_more.size(); ++a) {
-                    out_line += (e.ancestor_has_more[a] ? INDENT_PIPE : INDENT_SPACE);
-                }
-                out_line += (e.is_last ? INDENT_LAST : INDENT_BRANCH);
-            }
-
-            // Git column
-            if (s.show_git) {
-                if (s.use_ansi)
-                    out_line += git_styled_ansi(e.git).to_string();
-                else
-                    out_line += git_glyph(e.git).c_str();
-                out_line += " ";
-            }
-
-            // Icon column
-            if (s.use_ansi)
-                out_line += icon_styled_ansi(e.icon, e).to_string();
-            else
-                out_line += e.icon.c_str();
-            out_line += " ";
-
-            // Filename column
-            if (s.use_ansi)
-                out_line += filename_styled_ansi(e, is_cursor).to_string();
-            else
-                out_line += e.name.c_str();
-            if (e.kind == EntryKind::Directory)
-                out_line += "/";
-
-            // Size column
-            if (s.show_size && e.kind == EntryKind::File) {
-                out_line += "  ";
-                if (s.use_ansi)
-                    out_line += echo::format::String(format_size(e.size).c_str()).fg("#928374").to_string();
-                else
-                    out_line += format_size(e.size).c_str();
-            }
-
-            // Time column
-            if (s.show_time && e.mtime > 0) {
-                out_line += "  ";
-                if (s.use_ansi)
-                    out_line += echo::format::String(format_time(e.mtime).c_str()).fg("#928374").to_string();
-                else
-                    out_line += format_time(e.mtime).c_str();
-            }
-
-            // Determine which background to use for this line
-            int line_bg = (is_cursor && s.alt_screen && s.sel_bg_color >= 0) ? s.sel_bg_color
-                          : (s.alt_screen && s.bg_color >= 0)                ? s.bg_color
-                                                                             : -1;
-
-            if (line_bg >= 0) {
-                // Apply background to entire line content
-                std::string styled_line = apply_persistent_bg(out_line, line_bg);
-                int vis_width = visible_width(out_line);
-                int padding = term_width - vis_width;
-                if (padding < 0)
-                    padding = 0;
-
-                std::cout << "\x1b[48;5;" << line_bg << "m" << styled_line;
-                for (int p = 0; p < padding; ++p)
-                    std::cout << ' ';
-                std::cout << "\x1b[0m";
-                // Restore terminal bg if set
-                if (s.bg_color >= 0)
-                    std::cout << "\x1b[48;5;" << s.bg_color << "m";
-                std::cout << "\r\n";
-            } else {
-                std::cout << out_line << "\x1b[K\r\n";
-            }
-        }
-        // Clear from cursor to end of screen (removes leftover lines from previous render)
-        std::cout << "\x1b[J" << std::flush;
-    }
-
-    // =============================================================================================
-    // File operations
-    // =============================================================================================
-
-    static void toggle_select(TreeState &s) {
-        if (s.visible.empty())
-            return;
-        auto &e = s.visible[static_cast<dp::usize>(s.cursor)];
-        auto canon = fs::weakly_canonical(e.path);
-        if (s.selected.count(canon)) {
-            s.selected.erase(canon);
-            e.is_selected = false;
+        if (state.visible.empty()) {
+            state.cursor = 0;
         } else {
-            s.selected.insert(canon);
-            e.is_selected = true;
+            state.cursor = std::clamp(state.cursor, 0, static_cast<int>(state.visible.size()) - 1);
         }
     }
 
-    static void select_all(TreeState &s) {
-        for (auto &e : s.visible) {
-            auto canon = fs::weakly_canonical(e.path);
-            s.selected.insert(canon);
-            e.is_selected = true;
-        }
-    }
-
-    static void clear_selection(TreeState &s) {
-        s.selected.clear();
-        for (auto &e : s.visible) {
-            e.is_selected = false;
-        }
-    }
-
-    static void copy_selected(TreeState &s) {
-        s.clipboard.paths.clear();
-        s.clipboard.is_cut = false;
-        if (s.selected.empty()) {
-            if (!s.visible.empty()) {
-                s.clipboard.paths.push_back(s.visible[static_cast<dp::usize>(s.cursor)].path);
-            }
-        } else {
-            for (const auto &p : s.selected) {
-                s.clipboard.paths.push_back(p);
-            }
-        }
-        s.message = dp::String(std::to_string(s.clipboard.paths.size()).c_str()) + " file(s) copied";
-    }
-
-    static void cut_selected(TreeState &s) {
-        s.clipboard.paths.clear();
-        s.clipboard.is_cut = true;
-        if (s.selected.empty()) {
-            if (!s.visible.empty()) {
-                s.clipboard.paths.push_back(s.visible[static_cast<dp::usize>(s.cursor)].path);
-            }
-        } else {
-            for (const auto &p : s.selected) {
-                s.clipboard.paths.push_back(p);
-            }
-        }
-        s.message = dp::String(std::to_string(s.clipboard.paths.size()).c_str()) + " file(s) cut";
-    }
-
-    static void paste_clipboard(TreeState &s) {
-        if (s.clipboard.paths.empty()) {
-            s.message = "Nothing to paste";
+    static void reveal_target(TreeState &state) {
+        if (state.options.highlight_target.empty()) {
             return;
         }
 
-        // Determine destination directory
-        fs::path dest_dir = s.root;
-        if (!s.visible.empty()) {
-            auto &e = s.visible[static_cast<dp::usize>(s.cursor)];
-            if (e.kind == EntryKind::Directory) {
-                dest_dir = e.path;
-            } else {
-                dest_dir = e.path.parent_path();
-            }
-        }
-
-        int success = 0;
-        for (const auto &src : s.clipboard.paths) {
-            fs::path dest = dest_dir / src.filename();
-            try {
-                if (s.clipboard.is_cut) {
-                    fs::rename(src, dest);
-                } else {
-                    fs::copy(src, dest, fs::copy_options::recursive);
-                }
-                success++;
-            } catch (const fs::filesystem_error &ex) {
-                s.message = dp::String("Error: ") + ex.what();
-            }
-        }
-
-        if (s.clipboard.is_cut) {
-            s.clipboard.paths.clear();
-            clear_selection(s);
-        }
-
-        s.message = dp::String(std::to_string(success).c_str()) + " file(s) pasted";
-        refresh_git_status(s);
-        rebuild_visible(s);
-    }
-
-    static bool delete_selected(TreeState &s) {
-        dp::Vector<fs::path> to_delete;
-        if (s.selected.empty()) {
-            if (!s.visible.empty()) {
-                to_delete.push_back(s.visible[static_cast<dp::usize>(s.cursor)].path);
-            }
-        } else {
-            for (const auto &p : s.selected) {
-                to_delete.push_back(p);
-            }
-        }
-
-        if (to_delete.empty())
-            return false;
-
-        int success = 0;
-        for (const auto &p : to_delete) {
-            try {
-                fs::remove_all(p);
-                success++;
-            } catch (const fs::filesystem_error &ex) {
-                s.message = dp::String("Error: ") + ex.what();
-            }
-        }
-
-        clear_selection(s);
-        s.message = dp::String(std::to_string(success).c_str()) + " file(s) deleted";
-        refresh_git_status(s);
-        rebuild_visible(s);
-        return true;
-    }
-
-    static void cycle_sort(TreeState &s) {
-        s.sort = static_cast<SortKind>((static_cast<int>(s.sort) + 1) % 8);
-        rebuild_visible(s);
-    }
-
-    static void open_system(TreeState &s) {
-        if (s.visible.empty())
+        std::error_code relative_error;
+        const fs::path relative = fs::relative(state.options.highlight_target, state.options.root, relative_error);
+        if (relative_error) {
             return;
-        auto &e = s.visible[static_cast<dp::usize>(s.cursor)];
+        }
 
-#ifdef __APPLE__
-        std::string cmd = "open \"" + e.path.string() + "\" 2>/dev/null &";
-#elif defined(_WIN32)
-        std::string cmd = "start \"\" \"" + e.path.string() + "\"";
-#else
-        std::string cmd = "xdg-open \"" + e.path.string() + "\" 2>/dev/null &";
-#endif
-        system(cmd.c_str());
-        s.message = "Opened: " + path_to_string(e.path);
-    }
-
-    static void yank_path(TreeState &s) {
-        if (s.visible.empty())
-            return;
-        auto &e = s.visible[static_cast<dp::usize>(s.cursor)];
-
-        // Try to copy to system clipboard
-#ifdef __APPLE__
-        std::string cmd = "echo -n \"" + e.path.string() + "\" | pbcopy";
-#elif defined(_WIN32)
-        std::string cmd = "echo " + e.path.string() + " | clip";
-#else
-        std::string cmd = "echo -n \"" + e.path.string() + "\" | xclip -selection clipboard 2>/dev/null";
-#endif
-        system(cmd.c_str());
-        s.message = "Yanked: " + path_to_string(e.path);
-    }
-
-    // Read a line of input in raw mode (for rename/new)
-    static dp::String read_line_raw(const dp::String &prompt) {
-        std::cout << prompt.c_str() << std::flush;
-        dp::String result;
-        for (;;) {
-            auto key = scan::input::read_key();
-            if (!key)
+        fs::path current = state.options.root;
+        for (const auto &part : relative) {
+            current /= part;
+            if (current == state.options.highlight_target) {
                 break;
-            using scan::input::Key;
-            if (key->key == Key::Enter) {
-                std::cout << "\r\n" << std::flush;
-                break;
-            } else if (key->key == Key::Escape || key->key == Key::CtrlC) {
-                std::cout << "\r\n" << std::flush;
-                return ""; // Cancelled
-            } else if (key->key == Key::Backspace) {
-                if (!result.empty()) {
-                    result.pop_back();
-                    std::cout << "\b \b" << std::flush;
-                }
-            } else if (key->key == Key::Rune && key->rune >= 32 && key->rune < 127) {
-                result += static_cast<char>(key->rune);
-                std::cout << static_cast<char>(key->rune) << std::flush;
+            }
+            int index = find_entry_index(state, current);
+            if (index >= 0) {
+                state.visible[static_cast<std::size_t>(index)].is_expanded = true;
+                state.visible[static_cast<std::size_t>(index)].icon = std::string(ICON_FOLDER_OPEN);
+                rebuild_visible(state);
             }
         }
-        return result;
-    }
 
-    static void rename_entry(TreeState &s) {
-        if (s.visible.empty())
-            return;
-        auto &e = s.visible[static_cast<dp::usize>(s.cursor)];
-        if (e.depth == 0) {
-            s.message = "Cannot rename root";
-            return;
-        }
-
-        dp::String prompt = "Rename to: ";
-        dp::String new_name = read_line_raw(prompt);
-        if (new_name.empty()) {
-            s.message = "Rename cancelled";
-            return;
-        }
-
-        fs::path new_path = e.path.parent_path() / new_name.c_str();
-        try {
-            fs::rename(e.path, new_path);
-            s.message = "Renamed to: " + new_name;
-            refresh_git_status(s);
-            rebuild_visible(s);
-        } catch (const fs::filesystem_error &ex) {
-            s.message = dp::String("Error: ") + ex.what();
+        const int index = find_entry_index(state, state.options.highlight_target);
+        if (index >= 0) {
+            state.cursor = index;
         }
     }
 
-    static void create_new(TreeState &s, bool is_dir) {
-        // Determine parent directory
-        fs::path parent_dir = s.root;
-        if (!s.visible.empty()) {
-            auto &e = s.visible[static_cast<dp::usize>(s.cursor)];
-            if (e.kind == EntryKind::Directory) {
-                parent_dir = e.path;
-            } else {
-                parent_dir = e.path.parent_path();
-            }
-        }
-
-        dp::String prompt = is_dir ? "New directory: " : "New file: ";
-        dp::String name = read_line_raw(prompt);
-        if (name.empty()) {
-            s.message = "Create cancelled";
-            return;
-        }
-
-        fs::path new_path = parent_dir / name.c_str();
-        try {
-            if (is_dir) {
-                fs::create_directories(new_path);
-                s.message = "Created directory: " + name;
-            } else {
-                std::ofstream ofs(new_path);
-                ofs.close();
-                s.message = "Created file: " + name;
-            }
-            refresh_git_status(s);
-            rebuild_visible(s);
-        } catch (const fs::filesystem_error &ex) {
-            s.message = dp::String("Error: ") + ex.what();
-        }
+    static short color_pair_for(short fg, short bg) {
+        static std::map<int, short> pair_cache;
+        static short next_pair = 16;
+        const int key = (fg + 1) * 512 + (bg + 1);
+        auto it = pair_cache.find(key);
+        if (it != pair_cache.end())
+            return it->second;
+        if (next_pair >= COLOR_PAIRS)
+            return PAIR_DEFAULT;
+        init_pair(next_pair, fg, bg);
+        pair_cache[key] = next_pair;
+        return next_pair++;
     }
 
-    // =============================================================================================
-    // Main event loop
-    // =============================================================================================
+    static attr_t attr_from_ansi(short fg, short bg, bool bold = false) {
+        attr_t attr = has_colors() ? COLOR_PAIR(color_pair_for(fg, bg)) : A_NORMAL;
+        if (bold)
+            attr |= A_BOLD;
+        return attr;
+    }
 
-    static dp::Result<dp::Optional<fs::path>, dp::String> run_tree(TreeState &s, const dp::String &output_file) {
-        // Enter alternate screen if requested
-        if (s.alt_screen) {
-            std::cout << "\x1b[?1049h"; // Enter alternate screen
-            std::cout << "\x1b[?25l";   // Hide cursor
-            std::cout << std::flush;
+    static short color_from_hex(const std::string &hex) {
+        if (hex.size() != 7 || hex.front() != '#')
+            return ANSI_TEXT;
+
+        auto hex_byte = [&](int offset) { return std::stoi(hex.substr(offset, 2), nullptr, 16); };
+        const int r = hex_byte(1);
+        const int g = hex_byte(3);
+        const int b = hex_byte(5);
+
+        if (!can_change_color()) {
+            const int rr = (r * 5 + 127) / 255;
+            const int gg = (g * 5 + 127) / 255;
+            const int bb = (b * 5 + 127) / 255;
+            return static_cast<short>(16 + 36 * rr + 6 * gg + bb);
         }
 
-        scan::terminal::RawMode raw;
+        static std::map<std::string, short> color_cache;
+        static short next_color = 16;
+        auto it = color_cache.find(hex);
+        if (it != color_cache.end())
+            return it->second;
+        if (next_color >= COLORS)
+            return ANSI_TEXT;
 
-        refresh_git_status(s);
-        rebuild_visible(s);
+        const short color_id = next_color++;
+        init_color(color_id, static_cast<short>((r * 1000) / 255), static_cast<short>((g * 1000) / 255),
+                   static_cast<short>((b * 1000) / 255));
+        color_cache[hex] = color_id;
+        return color_id;
+    }
 
-        // If highlight target is set, find and select it
-        if (!s.highlight_target.empty()) {
-            // Expand parents to make target visible
-            fs::path target = fs::weakly_canonical(s.highlight_target);
-            fs::path current = s.root;
-            dp::Vector<fs::path> parents_to_expand;
+    static attr_t attr_from_hex(const std::string &hex, short bg, bool bold = false) {
+        return attr_from_ansi(color_from_hex(hex), bg, bold);
+    }
 
-            // Collect all parent directories that need expanding
-            fs::path rel = fs::relative(target, s.root);
-            for (const auto &part : rel) {
-                current = current / part;
-                if (current != target && fs::is_directory(current)) {
-                    parents_to_expand.push_back(fs::weakly_canonical(current));
-                }
+    static void draw_plain_line(int row, const std::string &line, attr_t attr) {
+        move(row, 0);
+        clrtoeol();
+        attrset(attr);
+        addnstr(line.c_str(), COLS);
+        attrset(A_NORMAL);
+    }
+
+    static void draw_chunk(int row, int &col, const std::string &text, attr_t attr) {
+        move(row, col);
+        attrset(attr);
+        addstr(text.c_str());
+        col = getcurx(stdscr);
+        attrset(A_NORMAL);
+    }
+
+    static void fill_line_bg(int row, short bg) {
+        move(row, 0);
+        attrset(has_colors() ? COLOR_PAIR(color_pair_for(-1, bg)) : A_NORMAL);
+        for (int col = 0; col < COLS; ++col)
+            addch(' ');
+        attrset(A_NORMAL);
+    }
+
+    static void draw_entry_line(int row, const TreeState &state, const Entry &entry, bool is_cursor) {
+        const short base_bg = (state.options.background_color >= 0 && COLORS > state.options.background_color)
+                                  ? static_cast<short>(state.options.background_color)
+                                  : -1;
+        const short selected_bg =
+            (state.options.selection_background_color >= 0 && COLORS > state.options.selection_background_color)
+                ? static_cast<short>(state.options.selection_background_color)
+                : COLOR_BLACK;
+        const short bg = is_cursor ? selected_bg : base_bg;
+        fill_line_bg(row, bg);
+        int col = 0;
+
+        draw_chunk(row, col, is_cursor ? "> " : "  ", attr_from_ansi(ANSI_WHITE, bg, is_cursor));
+        draw_chunk(row, col, entry.is_readonly ? std::string(MARK_READONLY) : " ", attr_from_ansi(ANSI_ACCENT_RED, bg));
+        draw_chunk(row, col, " ", attr_from_ansi(ANSI_WHITE, bg));
+
+        if (entry.depth > 0) {
+            std::size_t start = 0;
+            if (state.options.max_depth >= 0 &&
+                entry.ancestor_has_more.size() > static_cast<std::size_t>(state.options.max_depth)) {
+                start = entry.ancestor_has_more.size() - static_cast<std::size_t>(state.options.max_depth);
             }
-
-            // Expand each parent
-            for (const auto &p : parents_to_expand) {
-                dp::i32 idx = find_entry_index(s, p);
-                if (idx >= 0) {
-                    auto &e = s.visible[static_cast<dp::usize>(idx)];
-                    if (e.kind == EntryKind::Directory && !e.is_expanded) {
-                        e.is_expanded = true;
-                        e.icon = ICON_FOLDER_OPEN;
-                        rebuild_visible(s);
-                    }
-                }
+            for (std::size_t index = start; index < entry.ancestor_has_more.size(); ++index) {
+                draw_chunk(row, col,
+                           entry.ancestor_has_more[index] ? std::string(INDENT_PIPE) : std::string(INDENT_SPACE),
+                           attr_from_ansi(ANSI_DIM, bg));
             }
-
-            // Now find and highlight the target
-            dp::i32 idx = find_entry_index(s, target);
-            if (idx >= 0) {
-                s.cursor = idx;
-            }
+            draw_chunk(row, col, entry.is_last ? std::string(INDENT_LAST) : std::string(INDENT_BRANCH),
+                       attr_from_ansi(ANSI_DIM, bg));
         }
 
-        render(s);
-
-        for (;;) {
-            auto key = scan::input::read_key();
-            if (!key) {
-                if (s.alt_screen) {
-                    std::cout << "\x1b[?25h";   // Show cursor
-                    std::cout << "\x1b[?1049l"; // Leave alternate screen
-                    std::cout << std::flush;
-                }
-                return dp::result::Err(dp::String("failed to read key"));
-            }
-
-            s.message.clear(); // Clear message on any key
-
-            using scan::input::Key;
-            switch (key->key) {
-            case Key::Up:
-            case Key::CtrlP:
-                if (s.cursor > 0)
-                    s.cursor--;
+        if (state.options.show_git) {
+            short git_color = ANSI_DIM;
+            switch (entry.git) {
+            case GitKind::Modified:
+            case GitKind::Renamed:
+                git_color = ANSI_GIT_WARN;
                 break;
-            case Key::Down:
-            case Key::CtrlN:
-                if (s.cursor + 1 < static_cast<dp::i32>(s.visible.size()))
-                    s.cursor++;
+            case GitKind::Staged:
+                git_color = ANSI_GIT_OK;
                 break;
-            case Key::Rune:
-                switch (key->rune) {
-                case 'q':
-                case 'Q':
-                    if (s.alt_screen) {
-                        std::cout << "\x1b[?25h";   // Show cursor
-                        std::cout << "\x1b[?1049l"; // Leave alternate screen
-                        std::cout << std::flush;
-                    }
-                    return dp::result::Ok(dp::Optional<fs::path>{});
-                case 'j':
-                case 'J':
-                    if (s.cursor + 1 < static_cast<dp::i32>(s.visible.size()))
-                        s.cursor++;
-                    break;
-                case 'k':
-                case 'K':
-                    if (s.cursor > 0)
-                        s.cursor--;
-                    break;
-                case 'g': // Go to top
-                    s.cursor = 0;
-                    break;
-                case 'G': // Go to bottom
-                    s.cursor = static_cast<dp::i32>(s.visible.size()) - 1;
-                    break;
-                case 'h':
-                case 'H': {
-                    if (s.visible.empty())
-                        break;
-                    auto &e = s.visible[static_cast<dp::usize>(s.cursor)];
-                    fs::path entry_path = e.path;
-                    if (e.kind == EntryKind::Directory && e.is_expanded && e.depth != 0) {
-                        e.is_expanded = false;
-                        e.icon = ICON_FOLDER_CLOSED;
-                        rebuild_visible(s);
-                        s.cursor = find_entry_index(s, entry_path);
-                    } else if (e.depth > 0) {
-                        fs::path parent = entry_path.parent_path();
-                        s.cursor = find_entry_index(s, parent);
-                    }
-                } break;
-                case 'l':
-                case 'L': {
-                    if (s.visible.empty())
-                        break;
-                    auto &e = s.visible[static_cast<dp::usize>(s.cursor)];
-                    fs::path entry_path = e.path;
-                    if (e.kind == EntryKind::Directory) {
-                        e.is_expanded = true;
-                        e.icon = ICON_FOLDER_OPEN;
-                        rebuild_visible(s);
-                        s.cursor = find_entry_index(s, entry_path);
-                    }
-                } break;
-                case '.':
-                    s.show_hidden = !s.show_hidden;
-                    rebuild_visible(s);
-                    break;
-                case ' ': // Toggle select
-                    toggle_select(s);
-                    if (s.cursor + 1 < static_cast<dp::i32>(s.visible.size()))
-                        s.cursor++;
-                    break;
-                case 'a': // Select all
-                    select_all(s);
-                    break;
-                case 'A': // Clear selection
-                    clear_selection(s);
-                    break;
-                case 'y': // Copy
-                    copy_selected(s);
-                    break;
-                case 'd': // Cut
-                    cut_selected(s);
-                    break;
-                case 'p': // Paste
-                    paste_clipboard(s);
-                    break;
-                case 'D': // Delete
-                    delete_selected(s);
-                    break;
-                case 's': // Cycle sort
-                    cycle_sort(s);
-                    break;
-                case 'S': // Toggle size column
-                    s.show_size = !s.show_size;
-                    break;
-                case 't': // Toggle time column
-                    s.show_time = !s.show_time;
-                    break;
-                case 'o': // Open with system
-                    open_system(s);
-                    break;
-                case 'Y': // Yank path
-                    yank_path(s);
-                    break;
-                case 'R': // Refresh git status
-                    refresh_git_status(s);
-                    rebuild_visible(s);
-                    s.message = "Refreshed";
-                    break;
-                case '-': // Go to parent directory
-                    s.root = s.root.parent_path();
-                    refresh_git_status(s);
-                    rebuild_visible(s);
-                    break;
-                case 'r': // Rename
-                    rename_entry(s);
-                    break;
-                case 'n': // New file
-                    create_new(s, false);
-                    break;
-                case 'N': // New directory
-                    create_new(s, true);
-                    break;
-                case 'c': { // cd into directory
-                    if (s.visible.empty())
-                        break;
-                    auto &e = s.visible[static_cast<dp::usize>(s.cursor)];
-                    if (e.kind == EntryKind::Directory) {
-                        s.root = e.path;
-                        s.cursor = 0;
-                        refresh_git_status(s);
-                        rebuild_visible(s);
-                    }
-                } break;
-                }
+            case GitKind::Unmerged:
+            case GitKind::Deleted:
+                git_color = ANSI_GIT_BAD;
                 break;
-            case Key::Left: {
-                if (s.visible.empty())
-                    break;
-                auto &e = s.visible[static_cast<dp::usize>(s.cursor)];
-                fs::path entry_path = e.path;
-                if (e.kind == EntryKind::Directory && e.is_expanded && e.depth != 0) {
-                    e.is_expanded = false;
-                    e.icon = ICON_FOLDER_CLOSED;
-                    rebuild_visible(s);
-                    s.cursor = find_entry_index(s, entry_path);
-                }
-            } break;
-            case Key::Right: {
-                if (s.visible.empty())
-                    break;
-                auto &e = s.visible[static_cast<dp::usize>(s.cursor)];
-                fs::path entry_path = e.path;
-                if (e.kind == EntryKind::Directory) {
-                    e.is_expanded = true;
-                    e.icon = ICON_FOLDER_OPEN;
-                    rebuild_visible(s);
-                    s.cursor = find_entry_index(s, entry_path);
-                }
-            } break;
-            case Key::Enter: {
-                if (s.visible.empty())
-                    break;
-                auto &e = s.visible[static_cast<dp::usize>(s.cursor)];
-                if (e.kind == EntryKind::Directory) {
-                    // Toggle expand/collapse
-                    fs::path entry_path = e.path; // Save before rebuild invalidates ref
-                    e.is_expanded = !e.is_expanded;
-                    e.icon = e.is_expanded ? ICON_FOLDER_OPEN : ICON_FOLDER_CLOSED;
-                    rebuild_visible(s);
-                    s.cursor = find_entry_index(s, entry_path);
-                } else {
-                    if (s.alt_screen) {
-                        std::cout << "\x1b[?25h";   // Show cursor
-                        std::cout << "\x1b[?1049l"; // Leave alternate screen
-                        std::cout << std::flush;
-                    }
-                    if (!output_file.empty()) {
-                        std::ofstream ofs(output_file.c_str());
-                        ofs << e.path.string() << "\n";
-                        return dp::result::Ok(dp::Optional<fs::path>{});
-                    }
-                    return dp::result::Ok(dp::Optional<fs::path>(e.path));
-                }
-            } break;
-            case Key::Backspace: {
-                // Go to parent directory
-                if (s.root.has_parent_path() && s.root != s.root.root_path()) {
-                    s.root = s.root.parent_path();
-                    s.cursor = 0;
-                    refresh_git_status(s);
-                    rebuild_visible(s);
-                }
-            } break;
-            case Key::Escape:
-            case Key::CtrlC:
-                if (s.alt_screen) {
-                    std::cout << "\x1b[?25h";   // Show cursor
-                    std::cout << "\x1b[?1049l"; // Leave alternate screen
-                    std::cout << std::flush;
-                }
-                return dp::result::Ok(dp::Optional<fs::path>{});
             default:
                 break;
             }
+            draw_chunk(row, col, git_glyph(entry.git), attr_from_ansi(git_color, bg));
+            draw_chunk(row, col, " ", attr_from_ansi(ANSI_WHITE, bg));
+        }
 
-            render(s);
+        const std::string file_hex = icon_color_for_name(entry.name);
+        if (entry.kind == EntryKind::Directory)
+            draw_chunk(row, col, entry.icon, attr_from_ansi(1, bg));
+        else
+            draw_chunk(row, col, entry.icon, attr_from_hex(file_hex, bg));
+        draw_chunk(row, col, " ", attr_from_ansi(ANSI_WHITE, bg));
+
+        std::string name = entry.name;
+        if (entry.kind == EntryKind::Directory)
+            name += '/';
+        if (entry.kind == EntryKind::Directory)
+            draw_chunk(row, col, name, attr_from_ansi(1, bg, is_cursor));
+        else
+            draw_chunk(row, col, name, attr_from_hex(file_hex, bg, is_cursor));
+
+        if (state.options.show_size && entry.kind == EntryKind::File) {
+            draw_chunk(row, col, "  " + std::to_string(entry.size), attr_from_ansi(ANSI_DIM, bg));
+        }
+    }
+
+    static void render(const TreeState &state) {
+        erase();
+
+        int row = 0;
+        if (state.options.show_header && row < LINES) {
+            draw_plain_line(row++, "lis - tree.nvim-ish file browser", attr_from_ansi(ANSI_WHITE, -1, true));
+            draw_plain_line(row++, "root: " + state.options.root.string(), attr_from_ansi(ANSI_TEXT, -1));
+            draw_plain_line(row++, "j/k or arrows: move  h/l: collapse/expand  enter: select",
+                            attr_from_ansi(ANSI_DIM, -1));
+            draw_plain_line(row++, "g/G: top/bottom  q/esc/ctrl-c: quit", attr_from_ansi(ANSI_DIM, -1));
+            if (row < LINES) {
+                draw_plain_line(row++, "", A_NORMAL);
+            }
+        }
+
+        for (std::size_t index = 0; index < state.visible.size() && row < LINES; ++index) {
+            const bool is_cursor = static_cast<int>(index) == state.cursor;
+            draw_entry_line(row++, state, state.visible[index], is_cursor);
+        }
+
+        while (row < LINES) {
+            draw_plain_line(row++, "", A_NORMAL);
+        }
+
+        move(LINES - 1, COLS - 1);
+        wnoutrefresh(stdscr);
+        doupdate();
+    }
+
+    static void collapse_or_parent(TreeState &state) {
+        if (state.visible.empty()) {
+            return;
+        }
+        Entry &entry = state.visible[static_cast<std::size_t>(state.cursor)];
+        const fs::path path = entry.path;
+        if (entry.kind == EntryKind::Directory && entry.is_expanded && entry.depth > 0) {
+            entry.is_expanded = false;
+            entry.icon = std::string(ICON_FOLDER_CLOSED);
+            rebuild_visible(state);
+            state.cursor = std::max(0, find_entry_index(state, path));
+        } else if (entry.depth > 0) {
+            state.cursor = std::max(0, find_entry_index(state, path.parent_path()));
+        }
+    }
+
+    static void expand_or_open(TreeState &state) {
+        if (state.visible.empty()) {
+            return;
+        }
+        Entry &entry = state.visible[static_cast<std::size_t>(state.cursor)];
+        if (entry.kind != EntryKind::Directory) {
+            return;
+        }
+        const fs::path path = entry.path;
+        entry.is_expanded = true;
+        entry.icon = std::string(ICON_FOLDER_OPEN);
+        rebuild_visible(state);
+        state.cursor = std::max(0, find_entry_index(state, path));
+    }
+
+    static void toggle_directory(TreeState &state) {
+        if (state.visible.empty()) {
+            return;
+        }
+        Entry &entry = state.visible[static_cast<std::size_t>(state.cursor)];
+        if (entry.kind != EntryKind::Directory) {
+            return;
+        }
+        const fs::path path = entry.path;
+        entry.is_expanded = !entry.is_expanded;
+        entry.icon = entry.is_expanded ? std::string(ICON_FOLDER_OPEN) : std::string(ICON_FOLDER_CLOSED);
+        rebuild_visible(state);
+        state.cursor = std::max(0, find_entry_index(state, path));
+    }
+
+    static void print_help() {
+        std::cout << "lis - tree picker\n"
+                  << "usage: lis [options] [path]\n\n"
+                  << "options:\n"
+                  << "  -a, --all                         show hidden files\n"
+                  << "  -A, --alt-screen                  accepted for compatibility\n"
+                  << "  -c, --compact                     hide header\n"
+                  << "  -o, --output <file>               write selection to a file\n"
+                  << "      --cwd <dir>                   root directory for the tree\n"
+                  << "      --background <0-255>          background color\n"
+                  << "      --selection-background <n>    selection line background\n"
+                  << "      --git                         show git status glyphs\n"
+                  << "      --size                        show file sizes\n"
+                  << "      --generic-icons               use one icon for all files\n"
+                  << "      --max-depth <n>               indentation depth cap\n"
+                  << "      --help                        show this help\n"
+                  << "      --version                     show version\n";
+    }
+
+    static bool parse_number(const std::string &text, int &value) {
+        char *end = nullptr;
+        errno = 0;
+        const long parsed = std::strtol(text.c_str(), &end, 10);
+        if (errno != 0 || end == text.c_str() || *end != '\0') {
+            return false;
+        }
+        value = static_cast<int>(parsed);
+        return true;
+    }
+
+    static bool split_long_option(const std::string &argument, const std::string &name, std::string &value) {
+        const std::string prefix = name + "=";
+        if (argument.rfind(prefix, 0) != 0) {
+            return false;
+        }
+        value = argument.substr(prefix.size());
+        return true;
+    }
+
+    static bool read_value(int argc, char **argv, int &index, std::string &value) {
+        if (index + 1 >= argc) {
+            return false;
+        }
+        value = argv[++index];
+        return true;
+    }
+
+    static std::optional<Options> parse_args(int argc, char **argv) {
+        Options options;
+        std::optional<std::string> path_argument;
+
+        for (int index = 1; index < argc; ++index) {
+            const std::string argument = argv[index];
+            if (argument == "--help") {
+                print_help();
+                return std::nullopt;
+            }
+            if (argument == "--version") {
+                std::cout << "0.3.0\n";
+                return std::nullopt;
+            }
+            if (argument == "-a" || argument == "--all") {
+                options.show_hidden = true;
+                continue;
+            }
+            if (argument == "-A" || argument == "--alt-screen") {
+                options.alt_screen = true;
+                continue;
+            }
+            if (argument == "-c" || argument == "--compact") {
+                options.show_header = false;
+                continue;
+            }
+            if (argument == "--git") {
+                options.show_git = true;
+                continue;
+            }
+            if (argument == "--size") {
+                options.show_size = true;
+                continue;
+            }
+            if (argument == "--generic-icons") {
+                options.generic_icons = true;
+                continue;
+            }
+            if (argument == "-o" || argument == "--output") {
+                if (!read_value(argc, argv, index, options.output_file)) {
+                    std::cerr << "error: missing value for " << argument << "\n";
+                    return std::nullopt;
+                }
+                continue;
+            }
+            if (split_long_option(argument, "--output", options.output_file)) {
+                continue;
+            }
+
+            auto read_path_option = [&](const std::string &name, fs::path &target) -> bool {
+                std::string value;
+                if (argument == name) {
+                    if (!read_value(argc, argv, index, value)) {
+                        std::cerr << "error: missing value for " << name << "\n";
+                        return false;
+                    }
+                    target = fs::absolute(value);
+                    return true;
+                }
+                if (split_long_option(argument, name, value)) {
+                    target = fs::absolute(value);
+                    return true;
+                }
+                return false;
+            };
+
+            auto read_int_option = [&](const std::string &name, int &target) -> int {
+                std::string value;
+                if (argument == name) {
+                    if (!read_value(argc, argv, index, value)) {
+                        return -1;
+                    }
+                } else if (!split_long_option(argument, name, value)) {
+                    return 0;
+                }
+                return parse_number(value, target) ? 1 : -1;
+            };
+
+            if (read_path_option("--cwd", options.root)) {
+                continue;
+            }
+
+            const int background = read_int_option("--background", options.background_color);
+            if (background == 1) {
+                continue;
+            }
+            if (background == -1) {
+                std::cerr << "error: invalid value for --background\n";
+                return std::nullopt;
+            }
+
+            const int selection = read_int_option("--selection-background", options.selection_background_color);
+            if (selection == 1) {
+                continue;
+            }
+            if (selection == -1) {
+                std::cerr << "error: invalid value for --selection-background\n";
+                return std::nullopt;
+            }
+
+            const int max_depth = read_int_option("--max-depth", options.max_depth);
+            if (max_depth == 1) {
+                continue;
+            }
+            if (max_depth == -1) {
+                std::cerr << "error: invalid value for --max-depth\n";
+                return std::nullopt;
+            }
+
+            if (argument.size() > 2 && argument.front() == '-' && argument[1] != '-') {
+                bool valid = true;
+                for (std::size_t short_index = 1; short_index < argument.size(); ++short_index) {
+                    switch (argument[short_index]) {
+                    case 'a':
+                        options.show_hidden = true;
+                        break;
+                    case 'A':
+                        options.alt_screen = true;
+                        break;
+                    case 'c':
+                        options.show_header = false;
+                        break;
+                    default:
+                        valid = false;
+                        break;
+                    }
+                }
+                if (!valid) {
+                    std::cerr << "error: unknown option " << argument << "\n";
+                    return std::nullopt;
+                }
+                continue;
+            }
+
+            if (!argument.empty() && argument.front() == '-') {
+                std::cerr << "error: unknown option " << argument << "\n";
+                return std::nullopt;
+            }
+            path_argument = argument;
+        }
+
+        if (options.root.empty()) {
+            fs::path input = path_argument.has_value() ? fs::absolute(*path_argument) : fs::current_path();
+            if (!fs::exists(input)) {
+                std::cerr << "error: path does not exist: " << input.string() << "\n";
+                return std::nullopt;
+            }
+            if (fs::is_directory(input)) {
+                options.root = input;
+            } else {
+                options.root = input.parent_path();
+                options.highlight_target = input;
+            }
+        } else if (path_argument.has_value()) {
+            options.highlight_target = fs::absolute(*path_argument);
+        }
+
+        if (!fs::exists(options.root) || !fs::is_directory(options.root)) {
+            std::cerr << "error: cwd must be an existing directory\n";
+            return std::nullopt;
+        }
+        return options;
+    }
+
+    static std::optional<fs::path> run_tree(TreeState &state) {
+        CursesSession session(state.options);
+        refresh_git_status(state);
+        rebuild_visible(state);
+        reveal_target(state);
+        render(state);
+
+        for (;;) {
+            const int key = getch();
+            switch (key) {
+            case KEY_UP:
+            case 'k':
+            case 'K':
+                if (state.cursor > 0) {
+                    --state.cursor;
+                }
+                break;
+            case KEY_DOWN:
+            case 'j':
+            case 'J':
+                if (state.cursor + 1 < static_cast<int>(state.visible.size())) {
+                    ++state.cursor;
+                }
+                break;
+            case KEY_LEFT:
+            case 'h':
+            case 'H':
+            case KEY_BACKSPACE:
+            case 127:
+            case 8:
+                collapse_or_parent(state);
+                break;
+            case KEY_RIGHT:
+            case 'l':
+            case 'L':
+                expand_or_open(state);
+                break;
+            case '\n':
+            case '\r':
+            case KEY_ENTER:
+                if (state.visible.empty()) {
+                    break;
+                }
+                if (state.visible[static_cast<std::size_t>(state.cursor)].kind == EntryKind::Directory) {
+                    toggle_directory(state);
+                    break;
+                }
+                return state.visible[static_cast<std::size_t>(state.cursor)].path.filename();
+            case 'g':
+                state.cursor = 0;
+                break;
+            case 'G':
+                if (!state.visible.empty()) {
+                    state.cursor = static_cast<int>(state.visible.size()) - 1;
+                }
+                break;
+            case 'q':
+            case 'Q':
+            case 27:
+            case 3:
+                return std::nullopt;
+            default:
+                break;
+            }
+            render(state);
         }
     }
 
 } // namespace
 
-int main(int argc, char *argv[]) {
-    std::string path_str;
-    std::string cwd_str;
-    std::string output_str;
-    bool show_hidden = false;
-    bool alt_screen = false;
-    bool no_header = false;
-    bool generic_icons = false;
-    bool show_git = false;
-    bool show_size = false;
-    int max_depth = -1;
-    int bg_color = -1;
-    int sel_bg_color = -1;
-
-    auto cmd =
-        argu::Command("lis")
-            .version("0.3.0")
-            .about("Interactive tree file browser (tree.nvim-ish)")
-            .arg(argu::Arg("path")
-                     .positional()
-                     .help("Path to open (file or directory, or file to highlight if --cwd is set)")
-                     .value_of(path_str))
-            .arg(argu::Arg("cwd").long_name("cwd").help("Root directory for the tree").value_of(cwd_str))
-            .arg(argu::Arg("output")
-                     .short_name('o')
-                     .long_name("output")
-                     .help("Write selected path to file instead of stdout")
-                     .value_of(output_str))
-            .arg(argu::Arg("all").short_name('a').long_name("all").help("Show hidden files").flag(show_hidden))
-            .arg(argu::Arg("alt")
-                     .short_name('A')
-                     .long_name("alt-screen")
-                     .help("Use alternate screen buffer")
-                     .flag(alt_screen))
-            .arg(argu::Arg("compact").short_name('c').long_name("compact").help("Hide header and help").flag(no_header))
-            .arg(argu::Arg("generic")
-                     .short_name('g')
-                     .long_name("generic-icons")
-                     .help("Use generic icon for all files")
-                     .flag(generic_icons))
-            .arg(argu::Arg("git").short_name('G').long_name("git").help("Show git status column").flag(show_git))
-            .arg(argu::Arg("size").short_name('s').long_name("size").help("Show file size column").flag(show_size))
-            .arg(argu::Arg("depth")
-                     .short_name('d')
-                     .long_name("depth")
-                     .help("Max indent depth (-1 = unlimited)")
-                     .value_of(max_depth)
-                     .default_value(-1))
-            .arg(argu::Arg("bg")
-                     .long_name("background")
-                     .help("Terminal background (0-255, needs -A)")
-                     .value_of(bg_color)
-                     .default_value(-1))
-            .arg(argu::Arg("selbg")
-                     .long_name("selection-background")
-                     .help("Selection line background (0-255, needs -A)")
-                     .value_of(sel_bg_color)
-                     .default_value(-1));
-
-    auto parsed = cmd.parse(argc, argv);
-    if (!parsed || !parsed.message().empty())
-        return parsed.exit();
-
-    fs::path root;
-    fs::path highlight_target;
-
-    if (!cwd_str.empty()) {
-        // --cwd provided: use it as root, positional path is file to highlight
-        root = fs::absolute(fs::path(cwd_str));
-        if (!fs::exists(root)) {
-            std::cerr << "error: cwd path does not exist: " << root.string() << "\n";
-            return 2;
-        }
-        if (!fs::is_directory(root)) {
-            std::cerr << "error: cwd must be a directory: " << root.string() << "\n";
-            return 2;
-        }
-        if (!path_str.empty()) {
-            highlight_target = fs::absolute(fs::path(path_str));
-            if (!fs::exists(highlight_target)) {
-                std::cerr << "error: file path does not exist: " << highlight_target.string() << "\n";
-                return 2;
-            }
-        }
-    } else {
-        // No --cwd: use positional argument to determine root (and possibly highlight)
-        fs::path input_path = fs::absolute(path_str.empty() ? fs::current_path() : fs::path(path_str));
-
-        if (!fs::exists(input_path)) {
-            std::cerr << "error: path does not exist: " << input_path.string() << "\n";
-            return 2;
-        }
-
-        if (fs::is_directory(input_path)) {
-            root = input_path;
-        } else {
-            // It's a file - open parent directory and highlight the file
-            root = input_path.parent_path();
-            highlight_target = input_path;
-        }
-    }
-
-    TreeState state;
-    state.root = root;
-    state.show_hidden = show_hidden;
-    state.alt_screen = alt_screen;
-    state.show_header = !no_header;
-    state.generic_icons = generic_icons;
-    state.show_git = show_git;
-    state.show_size = show_size;
-    state.max_depth = static_cast<dp::i32>(max_depth);
-    state.bg_color = static_cast<dp::i32>(bg_color);
-    state.sel_bg_color = static_cast<dp::i32>(sel_bg_color);
-    state.highlight_target = highlight_target;
-
-    auto selected = run_tree(state, dp::String(output_str.c_str()));
-    if (!selected) {
-        std::cerr << "error: " << selected.error() << "\n";
-        return 1;
-    }
-
-    if (selected.value().has_value()) {
-        std::cout << selected.value().value().string() << "\n";
+int main(int argc, char **argv) {
+    const std::optional<Options> options = parse_args(argc, argv);
+    if (!options.has_value()) {
         return 0;
     }
 
+    TreeState state;
+    state.options = *options;
+
+    const std::optional<fs::path> selected = run_tree(state);
+    if (!selected.has_value()) {
+        return 0;
+    }
+
+    if (!options->output_file.empty()) {
+        std::ofstream stream(options->output_file);
+        stream << selected->string() << '\n';
+    }
+    std::cout << selected->string() << '\n';
     return 0;
 }
